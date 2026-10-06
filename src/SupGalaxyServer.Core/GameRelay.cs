@@ -84,6 +84,7 @@ public sealed class GameRelay
     public const string ImportChunkType = "ipfs_chunk_from_client_chunk";
     public const string ImportUpdateStartType = "ipfs_chunk_update_start";
     public const string ImportUpdateChunkType = "ipfs_chunk_update_chunk";
+    public const string ImportResultType = "server_import_result";
     private const int MaxTransactionIdLength = 256;
     private const int MaxWorldNameLength = 256;
 
@@ -276,6 +277,13 @@ public sealed class GameRelay
             case "i_am_alive":
                 return;
 
+            // P2P bookkeeping for imports. Relaying it made other players mark the transaction as processed before
+            // the server's ipfs_chunk_update_* fan-out arrived, so they dropped it. The server tracks merged
+            // transactions itself and sends them as processedIds in world sync.
+            case "processed_transaction_id":
+            case "sync_processed_transaction":
+                return;
+
             case "request_world_sync":
             {
                 var w = world ?? from.World;
@@ -378,9 +386,16 @@ public sealed class GameRelay
             || total is not { } t || t < 1 || t > maxChunks || Num(msg, "total") != t)
         {
             _log?.Invoke($"Rejected world import start from {from.Username}: invalid transactionId, world or total.");
+            if (!string.IsNullOrEmpty(tx) && tx.Length <= MaxTransactionIdLength)
+                SendImportResult(from, tx, world, ok: false, "invalid_start", retry: false);
             return;
         }
-        if (_worlds.IsImportProcessed(world, tx)) return; // Already merged: repeated delivery is a no-op.
+        if (_worlds.IsImportProcessed(world, tx))
+        {
+            // Already merged: repeated delivery is a no-op.
+            SendImportResult(from, tx, world, ok: true, "duplicate", retry: false);
+            return;
+        }
 
         var now = Clock();
         var key = (from.Username.ToLowerInvariant(), tx);
@@ -388,9 +403,11 @@ public sealed class GameRelay
         {
             ExpireImportsLocked(now);
             if (_imports.ContainsKey(key)) return; // Duplicate start.
-            if (_imports.Keys.Count(k => k.Sender == key.Item1) >= _settings.MaxPendingImportsPerPlayer)
+            var mine = _imports.Values.Where(v => v.Sender == key.Item1).ToList();
+            if (mine.Count >= _settings.MaxPendingImportsPerPlayer)
             {
-                _log?.Invoke($"Rejected world import {tx} from {from.Username}: too many unfinished imports.");
+                _log?.Invoke($"Rejected world import {tx} from {from.Username}: too many unfinished imports ({mine.Count}).");
+                SendImportResult(from, tx, world, ok: false, "busy", retry: true);
                 return;
             }
             _imports[key] = new ImportTransfer
@@ -413,10 +430,14 @@ public sealed class GameRelay
         var key = (from.Username.ToLowerInvariant(), tx);
         var now = Clock();
         ImportTransfer? complete = null;
+        string? rejected = null;
+        bool retry = false;
+        string? world = null;
         lock (_importGate)
         {
             ExpireImportsLocked(now);
             if (!_imports.TryGetValue(key, out var transfer)) return; // Unknown, expired, rejected or already merged.
+            world = transfer.World;
 
             var chunk = Str(msg, "chunk");
             var index = Long(msg, "index");
@@ -425,31 +446,47 @@ public sealed class GameRelay
             {
                 _imports.Remove(key);
                 _log?.Invoke($"Rejected world import {tx} from {from.Username}: malformed chunk.");
-                return;
+                rejected = "malformed_chunk";
             }
-            if (transfer.Chunks[i] is { } existing)
+            else if (transfer.Chunks[i] is { } existing)
             {
                 if (existing == chunk) return; // Duplicate chunk.
                 _imports.Remove(key);
                 _log?.Invoke($"Rejected world import {tx} from {from.Username}: conflicting copies of chunk {i}.");
-                return;
+                rejected = "conflicting_chunk";
+                retry = true;
             }
-            if (transfer.Chars + chunk.Length > _settings.MaxImportSize)
+            else if (transfer.Chars + chunk.Length > _settings.MaxImportSize)
             {
                 _imports.Remove(key);
                 _log?.Invoke($"Rejected world import {tx} from {from.Username}: larger than {_settings.MaxImportSize} characters.");
-                return;
+                rejected = "too_large";
             }
-            transfer.Chunks[i] = chunk;
-            transfer.Chars += chunk.Length;
-            transfer.Received++;
-            transfer.LastActivity = now;
-            if (transfer.Received == transfer.Chunks.Length)
+            else
             {
-                _imports.Remove(key);
-                complete = transfer;
+                long pending = _imports.Values.Where(v => v.Sender == key.Item1).Sum(v => v.Chars);
+                if (pending + chunk.Length > _settings.MaxPendingImportCharsPerPlayer)
+                {
+                    _imports.Remove(key);
+                    _log?.Invoke($"Rejected world import {tx} from {from.Username}: unfinished imports exceed {_settings.MaxPendingImportCharsPerPlayer} characters.");
+                    rejected = "busy";
+                    retry = true;
+                }
+                else
+                {
+                    transfer.Chunks[i] = chunk;
+                    transfer.Chars += chunk.Length;
+                    transfer.Received++;
+                    transfer.LastActivity = now;
+                    if (transfer.Received == transfer.Chunks.Length)
+                    {
+                        _imports.Remove(key);
+                        complete = transfer;
+                    }
+                }
             }
         }
+        if (rejected != null) SendImportResult(from, tx, world, ok: false, rejected, retry);
         if (complete != null) CompleteImport(from, complete);
     }
 
@@ -460,16 +497,22 @@ public sealed class GameRelay
         if (import == null)
         {
             _log?.Invoke($"Rejected world import {transfer.TransactionId} from {from.Username}: {error}.");
+            SendImportResult(from, transfer.TransactionId, transfer.World, ok: false, "malformed_payload", retry: false);
             return;
         }
-        if (import.ForeignWorldChunks > 0)
-            _log?.Invoke($"World import {transfer.TransactionId} from {from.Username}: ignored {import.ForeignWorldChunks} chunk(s) of other worlds.");
+        if (import.ForeignWorldChunks > 0 || import.SkippedEntries > 0)
+            _log?.Invoke($"World import {transfer.TransactionId} from {from.Username}: ignored {import.ForeignWorldChunks} chunk(s) of other worlds and {import.SkippedEntries} invalid entr(y/ies).");
 
-        int recipients = 0;
+        int recipients = 0, blocks = 0;
         lock (_stateGate)
         {
             var applied = _worlds.ApplyImport(transfer.World, transfer.TransactionId, WorldImport.ComputeTruncatedDate(transfer.Timestamp), import);
-            if (applied == null) return; // Already merged.
+            if (applied == null)
+            {
+                SendImportResult(from, transfer.TransactionId, transfer.World, ok: true, "duplicate", retry: false);
+                return;
+            }
+            blocks = applied.Chunks.Sum(c => c.Changes.Count);
             if (!applied.IsEmpty)
             {
                 var json = applied.ToJson();
@@ -509,8 +552,22 @@ public sealed class GameRelay
                 }
             }
         }
-        _log?.Invoke($"Merged world import {transfer.TransactionId} from {from.Username} into '{transfer.World}' ({transfer.Chunks.Length} chunk(s), sent to {recipients} player(s)).");
+        _log?.Invoke($"Merged world import {transfer.TransactionId} from {from.Username} into '{transfer.World}' ({transfer.Chunks.Length} chunk(s), {blocks} block(s), sent to {recipients} player(s)).");
+        SendImportResult(from, transfer.TransactionId, transfer.World, ok: true, null, retry: false, blocks);
         WorldImported?.Invoke(transfer.World);
+    }
+
+    /// <summary>
+    /// Tells the importing client what happened to its transfer: server_import_result
+    /// { transactionId, world, ok, reason?, retry, blocks? }. retry=true means the transfer was dropped for a
+    /// temporary reason (busy, timed out, conflicting chunk) and can be sent again.
+    /// </summary>
+    private void SendImportResult(PlayerSession to, string tx, string? world, bool ok, string? reason, bool retry, int? blocks = null)
+    {
+        var o = new JsonObject { ["type"] = ImportResultType, ["transactionId"] = tx, ["world"] = world, ["ok"] = ok, ["retry"] = retry };
+        if (reason != null) o["reason"] = reason;
+        if (blocks != null) o["blocks"] = blocks;
+        to.Send(Json(o));
     }
 
     /// <summary>Discards unfinished import transfers that have been idle longer than the import timeout.</summary>
@@ -527,11 +584,13 @@ public sealed class GameRelay
     private int ExpireImportsLocked(long now)
     {
         long timeoutMs = _settings.ImportTimeoutSeconds * 1000L;
-        var stale = _imports.Where(kv => now - kv.Value.LastActivity > timeoutMs).Select(kv => kv.Key).ToList();
-        foreach (var k in stale)
+        var stale = _imports.Where(kv => now - kv.Value.LastActivity > timeoutMs).ToList();
+        foreach (var (k, v) in stale)
         {
-            _log?.Invoke($"Discarded unfinished world import {k.TransactionId} from {k.Sender}: timed out.");
+            _log?.Invoke($"Discarded unfinished world import {k.TransactionId} from {k.Sender}: timed out ({v.Received}/{v.Chunks.Length} chunk(s) received).");
             _imports.Remove(k);
+            if (_players.Get(k.Sender) is { State: PlayerState.Connected } p)
+                SendImportResult(p, k.TransactionId, v.World, ok: false, "timeout", retry: true);
         }
         return stale.Count;
     }

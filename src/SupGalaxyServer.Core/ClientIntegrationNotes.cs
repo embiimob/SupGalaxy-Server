@@ -151,8 +151,18 @@
 //      - Block changes follow shouldApplyIpfsUpdate: applied when the import's truncated date is valid and >= the
 //        date of the last import that wrote that block. foreignBlockOrigins, stones and chests: last import wins.
 //      - A transactionId already merged into a world is ignored (idempotent); merged ids are sent as processedIds.
-//      - Malformed JSON/fields, conflicting duplicate chunks, transfers over MaxImportSize (100M chars) and transfers
-//        idle for ImportTimeoutSeconds (120s) are discarded without changing the world.
+//      - Invalid entries (non-integer or out-of-chunk x/y/z, bad block id, bad chunk key, bad origin/stone/chest) are
+//        skipped like applyDeltasToChunk does; the rest of the import is still merged.
+//      - Payloads that are not JSON / have the wrong top-level shape, conflicting duplicate chunks, transfers over
+//        MaxImportSize (100M chars) and transfers idle for ImportTimeoutSeconds (120s) are discarded without
+//        changing the world. Per player at most MaxPendingImportsPerPlayer (256) transfers and
+//        MaxPendingImportCharsPerPlayer (200M chars) may be in flight.
+//      - The sender gets { type: "server_import_result", world, transactionId, ok, reason?, retry?, blocks? }.
+//        ok=true once merged (reason "duplicate" if already merged). On ok=false with retry=true (busy, timeout,
+//        conflicting_chunk) resend the whole transfer later; other failures will fail again. Clients should only mark
+//        a transaction processed (processedMessages / worker update_processed) after ok=true.
+//      - processed_transaction_id and sync_processed_transaction are NOT relayed: relaying them made other players
+//        skip the server's ipfs_chunk_update_* fan-out for the same transaction.
 //  * world_sync payloads contain chunkDeltas, foreignBlockOrigins, processedIds, magicianStones, calligraphyStones
 //    and chests; world_sync_start also carries `revision`. World edits and imports applied after the snapshot was
 //    taken are held back and sent right after the last world_sync_chunk, so nothing is missed or overwritten.

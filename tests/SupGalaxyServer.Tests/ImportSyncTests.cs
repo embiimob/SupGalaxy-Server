@@ -249,22 +249,19 @@ public class ImportSyncTests : RelayTestBase
     [Fact]
     public void MalformedImports_DoNotChangeState()
     {
-        var (alice, _) = Join("alice", "alpha");
+        var (alice, a) = Join("alice", "alpha");
         var (_, b) = Join("bob", "alpha");
         Relay.HandleMessage(alice, """{"type":"block_change","world":"alpha","wx":1,"wy":1,"wz":1,"bid":3}""");
         var revision = Worlds.GetRevision("alpha");
 
+        // Structurally malformed payloads are rejected as a whole.
         string[] bad =
         {
             "{ not json",
             "42",
             """{"deltas":{}}""",
-            """[{"chunk":"alpha:2:3","changes":[{"x":16,"y":1,"z":1,"b":1}]}]""",
-            """[{"chunk":"alpha:2:3","changes":[{"x":1.5,"y":1,"z":1,"b":1}]}]""",
-            """[{"chunk":"alpha:2:3","changes":[{"x":1,"y":1,"z":1,"b":1}]},{"chunk":"bad key","changes":[]}]""",
-            """[{"chunk":"alpha:99999:3","changes":[]}]""",
-            """{"deltas":[{"chunk":"alpha:2:3","changes":[{"x":1,"y":1,"z":1,"b":1}]}],"foreignBlockOrigins":[["not a key","s"]]}""",
-            """{"deltas":[],"magicianStones":{"k":"not an object"}}""",
+            """{"deltas":[],"foreignBlockOrigins":{}}""",
+            """{"deltas":[],"magicianStones":[]}""",
         };
         for (int i = 0; i < bad.Length; i++) SendImport(alice, "bad" + i, bad[i]);
 
@@ -288,6 +285,107 @@ public class ImportSyncTests : RelayTestBase
         Assert.Empty(b.OfType("ipfs_chunk_update_start"));
         Assert.Equal(0, Relay.PendingImportCount);
         Assert.False(Worlds.IsImportProcessed("alpha", "bad0"));
+
+        var results = a.OfType("server_import_result");
+        Assert.Contains(results, r => (string?)r["transactionId"] == "bad0" && !(bool)r["ok"]! && (string?)r["reason"] == "malformed_payload");
+        Assert.Contains(results, r => (string?)r["transactionId"] == "conflict" && !(bool)r["ok"]! && (bool)r["retry"]!);
+        Assert.Contains(results, r => (string?)r["transactionId"] == "idx" && (string?)r["reason"] == "malformed_chunk");
+    }
+
+    [Fact]
+    public void InvalidEntries_AreSkipped_RestOfImportIsApplied()
+    {
+        var (alice, a) = Join("alice", "alpha");
+        var (_, b) = Join("bob", "alpha");
+
+        // Shapes seen in real SupGalaxy save sessions: stone/chest markers at fractional positions, y outside the
+        // world, chunk keys built from a full (>8 char) world name, null metadata fields.
+        var payload = """
+            {"deltas":[
+              {"chunk":"alpha:2:3","changes":[{"x":1,"y":10,"z":4,"b":42},{"x":1.5,"y":1,"z":1,"b":127},{"x":16,"y":1,"z":1,"b":1},
+                                              {"x":2,"y":-1,"z":1,"b":1},{"x":2,"y":256,"z":1,"b":1},{"x":2,"y":1,"z":1,"b":"5"},{"x":2,"y":1,"z":1}]},
+              {"chunk":"averylongworldname:1:1","changes":[{"x":0,"y":0,"z":0,"b":1}]},
+              {"chunk":"bad key","changes":[]},
+              {"chunk":"alpha:99999:3","changes":[]},
+              "not an object",
+              {"chunk":"alpha:2:4","changes":[{"x":3,"y":20,"z":5,"b":7}]}],
+             "foreignBlockOrigins":[["33,10,52","seedworld"],["not a key","s"],["1,2"]],
+             "magicianStones":{"k":"not an object","33,11,52":{"x":33,"y":11,"z":52,"url":"u"},"bad":{"x":"a","y":1,"z":1}},
+             "calligraphyStones":null,
+             "chests":{"gone":null}}
+            """;
+        SendImport(alice, "mixed", payload);
+
+        Assert.Equal(42, Worlds.GetBlock("alpha", Wx(1), 10, Wz));
+        Assert.Equal(7, Worlds.GetBlock("alpha", Wx(3), 20, 4 * 16 + 5));
+        Assert.Null(Worlds.GetBlock("alpha", Wx(2), 1, 3 * 16 + 1));
+        Assert.Equal("seedworld", Worlds.GetForeignOrigin("alpha", 33, 10, 52));
+        Assert.True(Worlds.HasStone(StoneKind.Magician, "alpha", "33,11,52"));
+        Assert.False(Worlds.HasStone(StoneKind.Magician, "alpha", "k"));
+        Assert.True(Worlds.IsImportProcessed("alpha", "mixed"));
+
+        var relayed = Reassemble(b, "ipfs_chunk_update_start", "ipfs_chunk_update_chunk");
+        Assert.Equal(2, relayed["deltas"]!.AsArray().Count);
+        var result = Assert.Single(a.OfType("server_import_result"));
+        Assert.True((bool)result["ok"]!);
+        Assert.Equal(2, (int)result["blocks"]!);
+    }
+
+    [Fact]
+    public void ProcessedTransactionId_IsNotRelayed_SoOthersApplyTheServerFanOut()
+    {
+        var (alice, _) = Join("alice", "alpha");
+        var (_, b) = Join("bob", "alpha");
+
+        // SupGalaxy sends processed_transaction_id right after it starts streaming the import.
+        var parts = Split(Payload(), 64);
+        Relay.HandleMessage(alice, Start("tx1", parts.Count));
+        Relay.HandleMessage(alice, """{"type":"processed_transaction_id","transactionId":"tx1"}""");
+        Relay.HandleMessage(alice, """{"type":"sync_processed_transaction","transactionId":"tx1"}""");
+        for (int i = 0; i < parts.Count; i++) Relay.HandleMessage(alice, Chunk("tx1", i, parts[i], parts.Count));
+
+        Assert.Empty(b.OfType("processed_transaction_id"));
+        Assert.Empty(b.OfType("sync_processed_transaction"));
+        Assert.Single(b.OfType("ipfs_chunk_update_start"));
+    }
+
+    [Fact]
+    public void ManyConcurrentImportsFromOnePlayer_AreAllMerged()
+    {
+        var (alice, a) = Join("alice", "alpha");
+        var (_, b) = Join("bob", "alpha");
+        const int n = 40;
+        var parts = Enumerable.Range(0, n).Select(i => Split(Payload(blockId: 100 + i, x: i % 16), 64)).ToList();
+
+        // Interleaved, like SupGalaxy's concurrent sendChunksAsync calls on one data channel.
+        for (int i = 0; i < n; i++) Relay.HandleMessage(alice, Start("tx" + i, parts[i].Count));
+        for (int c = 0; c < parts.Max(p => p.Count); c++)
+            for (int i = 0; i < n; i++)
+                if (c < parts[i].Count) Relay.HandleMessage(alice, Chunk("tx" + i, c, parts[i][c], parts[i].Count));
+
+        for (int i = 0; i < n; i++) Assert.True(Worlds.IsImportProcessed("alpha", "tx" + i));
+        Assert.Equal(0, Relay.PendingImportCount);
+        Assert.Equal(n, b.OfType("ipfs_chunk_update_start").Count);
+        Assert.Equal(n, a.OfType("server_import_result").Count(r => (bool)r["ok"]!));
+    }
+
+    [Fact]
+    public void PendingCharBudget_RejectsWithRetry()
+    {
+        Settings.MaxImportSize = 2048;
+        Settings.MaxPendingImportCharsPerPlayer = 2048;
+        var (alice, a) = Join("alice", "alpha");
+
+        Relay.HandleMessage(alice, Start("one", 2));
+        Relay.HandleMessage(alice, Chunk("one", 0, new string('x', 1500), 2));
+        Relay.HandleMessage(alice, Start("two", 2));
+        Relay.HandleMessage(alice, Chunk("two", 0, new string('y', 1000), 2));
+
+        var r = Assert.Single(a.OfType("server_import_result"));
+        Assert.Equal("two", (string?)r["transactionId"]);
+        Assert.Equal("busy", (string?)r["reason"]);
+        Assert.True((bool)r["retry"]!);
+        Assert.Equal(1, Relay.PendingImportCount);
     }
 
     [Fact]
@@ -313,7 +411,7 @@ public class ImportSyncTests : RelayTestBase
         long now = 1_000_000;
         Relay.Clock = () => now;
         Settings.ImportTimeoutSeconds = 30;
-        var (alice, _) = Join("alice", "alpha");
+        var (alice, a) = Join("alice", "alpha");
         var parts = Split(Payload(), 64);
 
         Relay.HandleMessage(alice, Start("slow", parts.Count));
@@ -323,6 +421,7 @@ public class ImportSyncTests : RelayTestBase
 
         now += 31_000;
         Assert.Equal(1, Relay.ExpireStaleImports());
+        Assert.Contains(a.OfType("server_import_result"), r => (string?)r["transactionId"] == "slow" && (string?)r["reason"] == "timeout" && (bool)r["retry"]!);
         Relay.HandleMessage(alice, Chunk("slow", parts.Count - 1, parts[^1], parts.Count)); // late last chunk
         Assert.Null(Worlds.GetBlock("alpha", Wx(1), 10, Wz));
         Assert.False(Worlds.IsImportProcessed("alpha", "slow"));

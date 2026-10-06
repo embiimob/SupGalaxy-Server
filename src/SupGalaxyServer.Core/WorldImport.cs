@@ -38,7 +38,8 @@ public sealed class WorldImport
     private static readonly Regex ChunkKeyPattern = new(@"^(.{1,8}):(\d{1,5}):(\d{1,5})$", RegexOptions.CultureInvariant);
     private static readonly Regex BlockKeyPattern = new(@"^-?\d{1,9},-?\d{1,9},-?\d{1,9}$", RegexOptions.CultureInvariant);
     private const int MaxKeyLength = 128;
-    private const long MaxBlockY = 1_000_000;
+    // Must match SupGalaxy js/declare.js MAX_HEIGHT; applyDeltasToChunk ignores changes outside 0..MAX_HEIGHT-1.
+    public const long MaxHeight = 256;
     private const long MaxBlockId = int.MaxValue;
     private static readonly long ChunksPerAxis = WorldStateStore.MapSize / WorldStateStore.ChunkSize;
 
@@ -55,6 +56,9 @@ public sealed class WorldImport
     /// <summary>Number of chunks in the payload that belong to another world and were ignored.</summary>
     public int ForeignWorldChunks { get; init; }
 
+    /// <summary>Invalid entries (block changes, chunk keys, origins, stones, chests) that were skipped.</summary>
+    public int SkippedEntries { get; init; }
+
     public bool IsEmpty => Chunks.Count == 0 && ForeignOrigins.Count == 0 && MagicianStones.Count == 0
                            && CalligraphyStones.Count == 0 && Chests.Count == 0;
 
@@ -68,8 +72,11 @@ public sealed class WorldImport
 
     /// <summary>
     /// Parses and validates a re-assembled payload for <paramref name="world"/>. Chunks whose key belongs to another
-    /// world are skipped. Returns null (with an error) when the payload is structurally malformed; nothing is applied
-    /// in that case.
+    /// world are skipped. Like SupGalaxy's applyChunkUpdates / applyDeltasToChunk, individual invalid entries
+    /// (a block change with a fractional or out of range coordinate, an unparsable chunk key, a bad origin, stone or
+    /// chest) are skipped and counted in <see cref="SkippedEntries"/> instead of discarding the whole import, because
+    /// real save sessions contain such entries. Returns null (with an error) only when the payload itself is not a
+    /// JSON array/object or its top-level fields have the wrong type; nothing is applied in that case.
     /// </summary>
     public static WorldImport? Parse(string world, string json, out string? error)
     {
@@ -98,38 +105,50 @@ public sealed class WorldImport
         else return Fail(out error, "payload must be an array or an object");
 
         var chunks = new List<ImportChunk>();
-        int foreignWorld = 0;
+        int foreignWorld = 0, skipped = 0;
         if (deltas != null)
         {
             foreach (var entry in deltas)
             {
-                if (entry is not JsonObject c) return Fail(out error, "chunk entry must be an object");
-                if (!TryString(c["chunk"], out var rawKey)) return Fail(out error, "chunk key missing");
-                if (c["changes"] is not JsonArray changes) return Fail(out error, "chunk changes must be an array");
+                if (entry is not JsonObject c || !TryString(c["chunk"], out var rawKey) || c["changes"] is not JsonArray changes)
+                {
+                    skipped++;
+                    continue;
+                }
                 var key = rawKey.StartsWith('#') ? rawKey[1..] : rawKey;
                 var m = ChunkKeyPattern.Match(key);
-                if (!m.Success) return Fail(out error, $"invalid chunk key '{Trunc(rawKey)}'");
+                if (!m.Success)
+                {
+                    skipped++;
+                    continue;
+                }
                 long cx = long.Parse(m.Groups[2].Value, CultureInfo.InvariantCulture);
                 long cz = long.Parse(m.Groups[3].Value, CultureInfo.InvariantCulture);
-                if (cx >= ChunksPerAxis || cz >= ChunksPerAxis) return Fail(out error, $"chunk key out of range '{Trunc(rawKey)}'");
-
-                var list = new List<ImportChange>(changes.Count);
-                foreach (var ch in changes)
+                if (cx >= ChunksPerAxis || cz >= ChunksPerAxis)
                 {
-                    if (ch is not JsonObject o
-                        || !TryInt(o["x"], out var x) || !TryInt(o["y"], out var y) || !TryInt(o["z"], out var z) || !TryInt(o["b"], out var b))
-                        return Fail(out error, "block change must have integer x, y, z and b");
-                    if (x < 0 || x >= WorldStateStore.ChunkSize || z < 0 || z >= WorldStateStore.ChunkSize || Math.Abs(y) > MaxBlockY
-                        || b < 0 || b > MaxBlockId)
-                        return Fail(out error, "block change out of range");
-                    list.Add(new ImportChange(x, y, z, b));
+                    skipped++;
+                    continue;
                 }
-
                 if (!string.Equals(m.Groups[1].Value, prefix, StringComparison.Ordinal))
                 {
                     foreignWorld++;
                     continue;
                 }
+
+                var list = new List<ImportChange>(changes.Count);
+                foreach (var ch in changes)
+                {
+                    if (ch is not JsonObject o
+                        || !TryInt(o["x"], out var x) || !TryInt(o["y"], out var y) || !TryInt(o["z"], out var z) || !TryInt(o["b"], out var b)
+                        || x < 0 || x >= WorldStateStore.ChunkSize || z < 0 || z >= WorldStateStore.ChunkSize
+                        || y < 0 || y >= MaxHeight || b < 0 || b > MaxBlockId)
+                    {
+                        skipped++;
+                        continue;
+                    }
+                    list.Add(new ImportChange(x, y, z, b));
+                }
+                if (list.Count == 0) continue;
                 bool? neutral = c["ownershipNeutral"] is JsonValue nv && nv.TryGetValue<bool>(out var nb) ? nb : null;
                 chunks.Add(new ImportChunk(key, cx, cz, list, neutral));
             }
@@ -149,13 +168,16 @@ public sealed class WorldImport
                 {
                     if (e is not JsonArray pair || pair.Count != 2 || !TryString(pair[0], out var k) || !TryString(pair[1], out var seed)
                         || !BlockKeyPattern.IsMatch(k) || seed.Length == 0 || seed.Length > MaxKeyLength)
-                        return Fail(out error, "foreignBlockOrigins entries must be [\"x,y,z\", seed]");
+                    {
+                        skipped++;
+                        continue;
+                    }
                     origins.Add(new(k, seed));
                 }
             }
-            if (!ReadKeyed(obj["magicianStones"], magician, requirePosition: true, out error)) return null;
-            if (!ReadKeyed(obj["calligraphyStones"], calligraphy, requirePosition: true, out error)) return null;
-            if (!ReadKeyed(obj["chests"], chestMap, requirePosition: true, out error)) return null;
+            if (!ReadKeyed(obj["magicianStones"], magician, ref skipped, out error)) return null;
+            if (!ReadKeyed(obj["calligraphyStones"], calligraphy, ref skipped, out error)) return null;
+            if (!ReadKeyed(obj["chests"], chestMap, ref skipped, out error)) return null;
         }
 
         return new WorldImport
@@ -167,6 +189,7 @@ public sealed class WorldImport
             CalligraphyStones = calligraphy,
             Chests = chestMap,
             ForeignWorldChunks = foreignWorld,
+            SkippedEntries = skipped,
         };
     }
 
@@ -205,7 +228,7 @@ public sealed class WorldImport
         return o;
     }
 
-    private static bool ReadKeyed(JsonNode? node, Dictionary<string, JsonNode> into, bool requirePosition, out string? error)
+    private static bool ReadKeyed(JsonNode? node, Dictionary<string, JsonNode> into, ref int skipped, out string? error)
     {
         error = null;
         if (node == null) return true;
@@ -218,10 +241,10 @@ public sealed class WorldImport
         {
             if (v == null) continue; // SupGalaxy skips null entries (removed chests).
             if (k.Length == 0 || k.Length > MaxKeyLength || v is not JsonObject data
-                || (requirePosition && (!IsNumber(data["x"]) || !IsNumber(data["y"]) || !IsNumber(data["z"]))))
+                || !IsNumber(data["x"]) || !IsNumber(data["y"]) || !IsNumber(data["z"]))
             {
-                error = $"invalid stone/chest entry '{Trunc(k)}'";
-                return false;
+                skipped++;
+                continue;
             }
             into[k] = data.DeepClone();
         }
@@ -249,8 +272,6 @@ public sealed class WorldImport
         value = (long)d;
         return true;
     }
-
-    private static string Trunc(string s) => s.Length > 40 ? s[..40] + "…" : s;
 
     private static WorldImport? Fail(out string? error, string message)
     {

@@ -60,8 +60,14 @@ public sealed class ServerSettings
     /// <summary>An unfinished import transfer is discarded after this many seconds without a new chunk.</summary>
     public int ImportTimeoutSeconds { get; set; } = 120;
 
-    /// <summary>Maximum unfinished import transfers per player.</summary>
-    public int MaxPendingImportsPerPlayer { get; set; } = 4;
+    /// <summary>
+    /// Maximum unfinished import transfers per player. SupGalaxy starts one transfer per Chunk Keyword transaction
+    /// it loads, all at once, so a large explored area produces many concurrent transfers.
+    /// </summary>
+    public int MaxPendingImportsPerPlayer { get; set; } = 256;
+
+    /// <summary>Maximum characters buffered for one player's unfinished import transfers combined.</summary>
+    public long MaxPendingImportCharsPerPlayer { get; set; } = 200L * 1024 * 1024;
 
     public int PlayerPortCount => PlayerPortEnd - PlayerPortStart + 1;
 
@@ -90,6 +96,8 @@ public sealed class ServerSettings
         if (MaxImportSize < 1024) errors.Add("Max import size must be at least 1024.");
         if (ImportTimeoutSeconds < 1) errors.Add("Import timeout must be at least 1 second.");
         if (MaxPendingImportsPerPlayer < 1) errors.Add("Max pending imports per player must be at least 1.");
+        if (MaxPendingImportCharsPerPlayer < MaxImportSize)
+            errors.Add("Max pending import characters per player must be at least the max import size.");
         return errors;
     }
 
@@ -100,6 +108,8 @@ public sealed class ServerSettings
         return copy;
     }
 
+    private const int LegacyMaxPendingImportsPerPlayer = 4;
+
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
     public static ServerSettings Load(string path)
@@ -107,7 +117,14 @@ public sealed class ServerSettings
         if (!File.Exists(path)) return new ServerSettings();
         try
         {
-            return JsonSerializer.Deserialize<ServerSettings>(File.ReadAllText(path), JsonOptions) ?? new ServerSettings();
+            var json = File.ReadAllText(path);
+            var settings = JsonSerializer.Deserialize<ServerSettings>(json, JsonOptions) ?? new ServerSettings();
+            // Files written before MaxPendingImportCharsPerPlayer existed carry the old default of 4 pending
+            // imports, far too low for SupGalaxy's concurrent Chunk Keyword uploads.
+            if (settings.MaxPendingImportsPerPlayer == LegacyMaxPendingImportsPerPlayer &&
+                !json.Contains("\"" + nameof(MaxPendingImportCharsPerPlayer) + "\"", StringComparison.Ordinal))
+                settings.MaxPendingImportsPerPlayer = new ServerSettings().MaxPendingImportsPerPlayer;
+            return settings;
         }
         catch (JsonException)
         {
