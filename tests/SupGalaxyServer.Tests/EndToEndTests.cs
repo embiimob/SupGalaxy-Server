@@ -273,4 +273,48 @@ public class EndToEndTests : IAsyncLifetime
         }
         _host = restarted;
     }
+
+    [Fact]
+    public async Task LargeImport_OverWebRtc_IsMergedSharedAndSyncedToLateJoiner()
+    {
+        var (alice, _) = await RtcTestClient.ConnectAsync(_http, "alice", "Ender");
+        using var _a = alice;
+        await alice.WaitFor("server_welcome");
+        var (bob, _) = await RtcTestClient.ConnectAsync(_http, "bob", "Ender");
+        using var _b = bob;
+        await bob.WaitFor("server_welcome");
+
+        // A city-sized save session: many chunks, sent like SupGalaxy's applyChunkUpdates (128K char pieces).
+        var deltas = new JsonArray();
+        for (int c = 0; c < 400; c++)
+        {
+            var changes = new JsonArray();
+            for (int i = 0; i < 64; i++) changes.Add(new JsonObject { ["x"] = i % 16, ["y"] = 60 + i / 16, ["z"] = (i * 7) % 16, ["b"] = 5 + i % 3 });
+            deltas.Add(new JsonObject { ["chunk"] = $"Ender:{c % 20}:{c / 20}", ["changes"] = changes });
+        }
+        var payload = new JsonObject { ["deltas"] = deltas, ["foreignBlockOrigins"] = null, ["magicianStones"] = null }.ToJsonString();
+        const int size = 131072;
+        var parts = new List<string>();
+        for (int i = 0; i < payload.Length; i += size) parts.Add(payload.Substring(i, Math.Min(size, payload.Length - i)));
+        Assert.True(parts.Count > 5);
+
+        alice.Send(new { type = "ipfs_chunk_from_client_start", total = parts.Count, fromAddress = "addr", timestamp = 1790000000000L, world = "Ender", transactionId = "city" });
+        for (int i = 0; i < parts.Count; i++)
+            alice.Send(new { type = "ipfs_chunk_from_client_chunk", transactionId = "city", index = i, chunk = parts[i], total = parts.Count });
+
+        var ack = await alice.WaitFor("server_import_result", timeoutMs: 20000);
+        Assert.True((bool)ack["ok"]!, ack.ToJsonString());
+        Assert.True(_host.Worlds.IsImportProcessed("Ender", "city"));
+        await RelayTestBase.Eventually(() => bob.Received.Count(m => (string?)m["type"] == "ipfs_chunk_update_chunk") == parts.Count, 20000);
+
+        var (carol, _) = await RtcTestClient.ConnectAsync(_http, "carol", "Ender");
+        using var _c = carol;
+        var start = await carol.WaitFor("world_sync_start");
+        int total = (int)start["total"]!;
+        await RelayTestBase.Eventually(() => carol.Received.Count(m => (string?)m["type"] == "world_sync_chunk") == total, 20000);
+        var sync = JsonNode.Parse(string.Concat(carol.Received.Where(m => (string?)m["type"] == "world_sync_chunk")
+            .OrderBy(m => (int)m["index"]!).Select(m => (string)m["chunk"]!)))!;
+        Assert.Equal(400, sync["chunkDeltas"]!.AsArray().Count);
+        Assert.Contains("city", sync["processedIds"]!.AsArray().Select(n => (string?)n));
+    }
 }
