@@ -31,6 +31,21 @@ public class GameRelayTests : RelayTestBase
     }
 
     [Fact]
+    public void AuthorityReForwardingRelayedMessage_IsNotEchoed()
+    {
+        var (alice, _) = Join("alice");
+        var (bob, _) = Join("bob");
+        var (_, c) = Join("carol");
+
+        Relay.HandleMessage(bob, """{"type":"chat","username":"bob","message":"héllo"}""");
+        // SupGalaxy's host code re-serializes and forwards what it received; the server must not duplicate it.
+        Relay.HandleMessage(alice, """{"type":"chat","username":"bob","message":"héllo"}""");
+        Relay.HandleMessage(alice, """{"type":"chat","username":"alice","message":"own message"}""");
+
+        Assert.Equal(2, c.OfType("chat").Count);
+    }
+
+    [Fact]
     public void PlayerMove_IsScopedToWorld_AndUpdatesPosition()
     {
         var (alice, _) = Join("alice", "alpha");

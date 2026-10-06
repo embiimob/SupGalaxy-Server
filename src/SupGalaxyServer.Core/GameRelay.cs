@@ -70,6 +70,14 @@ public sealed class GameRelay
     private readonly object _authorityGate = new();
     private readonly Dictionary<string, string> _authorities = new(StringComparer.Ordinal);
 
+    // Recently relayed player messages. SupGalaxy's host code re-forwards messages it receives to its peers;
+    // when the world authority does that through the server it would echo a duplicate to everyone, so the
+    // authority's copy of a message the server relayed moments ago is dropped.
+    private static readonly long EchoWindowMs = 3000;
+    private readonly object _echoGate = new();
+    private readonly Dictionary<string, (long Tick, string Sender)> _recent = new(StringComparer.Ordinal);
+    private long _lastEchoPrune;
+
     public GameRelay(PlayerRegistry players, WorldStateStore worlds, ServerSettings settings, Action<string>? log = null)
     {
         _players = players;
@@ -177,6 +185,17 @@ public sealed class GameRelay
             modified = true;
         }
 
+        // Compared in canonical form because the authority's JS re-serializes what it forwards.
+        var canonical = msg.ToJsonString();
+        if (isAuthority)
+        {
+            if (IsEcho(from, canonical)) return;
+        }
+        else
+        {
+            RememberRelayed(from, canonical);
+        }
+
         var world = Str(msg, "world");
 
         switch (type)
@@ -241,7 +260,7 @@ public sealed class GameRelay
                 break;
         }
 
-        if (modified) raw = msg.ToJsonString();
+        if (modified) raw = canonical;
 
         // Unicast (p2p_signal for proximity voice/video, authority replies such as remove_from_inventory).
         var to = Str(msg, "to");
@@ -272,6 +291,31 @@ public sealed class GameRelay
             if (world != null && p.World != null && p.World != world) continue;
             if (droppable && p.Transport is { } t && t.BufferedAmount > CongestedThreshold) continue;
             p.Send(raw);
+        }
+    }
+
+    private void RememberRelayed(PlayerSession from, string raw)
+    {
+        long now = Environment.TickCount64;
+        lock (_echoGate)
+        {
+            _recent[raw] = (now, from.Username);
+            if (now - _lastEchoPrune > EchoWindowMs)
+            {
+                _lastEchoPrune = now;
+                foreach (var key in _recent.Where(kv => now - kv.Value.Tick > EchoWindowMs).Select(kv => kv.Key).ToList())
+                    _recent.Remove(key);
+            }
+        }
+    }
+
+    private bool IsEcho(PlayerSession from, string raw)
+    {
+        lock (_echoGate)
+        {
+            return _recent.TryGetValue(raw, out var seen)
+                   && Environment.TickCount64 - seen.Tick <= EchoWindowMs
+                   && !string.Equals(seen.Sender, from.Username, StringComparison.OrdinalIgnoreCase);
         }
     }
 
