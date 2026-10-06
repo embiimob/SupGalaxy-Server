@@ -7,13 +7,9 @@ public abstract class RelayTestBase
     internal readonly ServerSettings Settings = new() { ServerName = "TestServer" };
     internal readonly GameRelay Relay;
 
-    /// <summary>Clock (Unix ms) and Math.random replacement used by the game rules.</summary>
-    internal long NowMs = 1_700_000_000_000;
-    internal double NextRandom = 0.5;
-
     protected RelayTestBase()
     {
-        Relay = new GameRelay(Players, Worlds, Settings, null, new Rules.WorldRules(Worlds, Players, null, () => NowMs, () => NextRandom));
+        Relay = new GameRelay(Players, Worlds, Settings);
     }
 
     internal (PlayerSession Session, FakeTransport Transport) Join(string name, string world = "alpha")

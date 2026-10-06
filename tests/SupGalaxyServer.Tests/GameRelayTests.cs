@@ -31,6 +31,21 @@ public class GameRelayTests : RelayTestBase
     }
 
     [Fact]
+    public void AuthorityReForwardingRelayedMessage_IsNotEchoed()
+    {
+        var (alice, _) = Join("alice");
+        var (bob, _) = Join("bob");
+        var (_, c) = Join("carol");
+
+        Relay.HandleMessage(bob, """{"type":"chat","username":"bob","message":"héllo"}""");
+        // SupGalaxy's host code re-serializes and forwards what it received; the server must not duplicate it.
+        Relay.HandleMessage(alice, """{"type":"chat","username":"bob","message":"héllo"}""");
+        Relay.HandleMessage(alice, """{"type":"chat","username":"alice","message":"own message"}""");
+
+        Assert.Equal(2, c.OfType("chat").Count);
+    }
+
+    [Fact]
     public void PlayerMove_IsScopedToWorld_AndUpdatesPosition()
     {
         var (alice, _) = Join("alice", "alpha");
@@ -60,7 +75,7 @@ public class GameRelayTests : RelayTestBase
     }
 
     [Fact]
-    public void SpoofedUsername_IsRewritten()
+    public void SpoofedUsername_IsRewrittenForNonAuthority()
     {
         Join("alice");
         var (bob, _) = Join("bob");
@@ -87,16 +102,51 @@ public class GameRelayTests : RelayTestBase
     }
 
     [Fact]
-    public void PlayerLeaving_IsAnnounced()
+    public void FirstPlayerInWorld_BecomesAuthority_AndRequestsAreRoutedToIt()
+    {
+        var (alice, a) = Join("alice");
+        var (bob, b) = Join("bob");
+        var (_, c) = Join("carol");
+
+        Assert.Equal("alice", Relay.GetAuthority("alpha"));
+        Assert.True(Relay.IsAuthority(alice));
+        Assert.Contains(b.OfType("server_authority"), m => (string?)m["username"] == "alice");
+
+        Relay.HandleMessage(bob, """{"type":"request_block_place","username":"bob","world":"alpha","x":1,"y":2,"z":3,"blockId":4}""");
+
+        Assert.Single(a.OfType("request_block_place"));
+        Assert.Empty(c.OfType("request_block_place"));
+    }
+
+    [Fact]
+    public void AuthorityMovesToNextOldestPlayer_WhenAuthorityLeaves()
     {
         var (alice, _) = Join("alice");
         var (_, b) = Join("bob");
+        Join("carol");
 
         Players.Remove(alice);
         alice.State = PlayerState.Disconnected;
         Relay.OnPlayerLeft(alice);
 
+        Assert.Equal("bob", Relay.GetAuthority("alpha"));
         Assert.Contains(b.OfType("remove_peer"), m => (string?)m["username"] == "alice");
+        Assert.Contains(b.OfType("server_authority"), m => (string?)m["username"] == "bob");
+    }
+
+    [Fact]
+    public void AuthorityMayActOnBehalfOfOthers_AndUnicastWithTo()
+    {
+        var (alice, _) = Join("alice");
+        var (_, b) = Join("bob");
+        var (_, c) = Join("carol");
+
+        Relay.HandleMessage(alice, """{"type":"remove_from_inventory","to":"bob","blockId":4,"count":1}""");
+        Relay.HandleMessage(alice, """{"type":"block_break","username":"bob","world":"alpha","x":1,"y":2,"z":3,"blockId":4}""");
+
+        Assert.Single(b.OfType("remove_from_inventory"));
+        Assert.Empty(c.OfType("remove_from_inventory"));
+        Assert.Equal("bob", (string?)Assert.Single(c.OfType("block_break"))["username"]);
     }
 
     [Fact]
@@ -110,6 +160,34 @@ public class GameRelayTests : RelayTestBase
 
         Assert.Single(a.OfType("p2p_signal"));
         Assert.Empty(c.OfType("p2p_signal"));
+    }
+
+    [Fact]
+    public void BlockMessages_ArePersisted()
+    {
+        var (alice, _) = Join("alice");
+
+        Relay.HandleMessage(alice, """{"type":"block_change","world":"alpha","wx":17,"wy":5,"wz":-1,"bid":7,"originSeed":"other"}""");
+        Relay.HandleMessage(alice, """{"type":"batch_block_change","messages":[{"type":"block_change","world":"alpha","wx":1,"wy":1,"wz":1,"bid":3}]}""");
+        Relay.HandleMessage(alice, """{"type":"block_place","world":"alpha","x":2,"y":2,"z":2,"blockId":9}""");
+        Relay.HandleMessage(alice, """{"type":"block_break","world":"alpha","x":1,"y":1,"z":1,"blockId":3}""");
+
+        Assert.Equal(7, Worlds.GetBlock("alpha", 17, 5, -1));
+        Assert.Equal("other", Worlds.GetForeignOrigin("alpha", 17, 5, -1));
+        Assert.Equal(9, Worlds.GetBlock("alpha", 2, 2, 2));
+        Assert.Equal(0, Worlds.GetBlock("alpha", 1, 1, 1));
+    }
+
+    [Fact]
+    public void Stones_ArePersistedAndRemoved()
+    {
+        var (alice, _) = Join("alice");
+
+        Relay.HandleMessage(alice, """{"type":"magician_stone_placed","stoneData":{"x":1,"y":2,"z":3,"url":"https://x"}}""");
+        Assert.True(Worlds.HasStone(StoneKind.Magician, "alpha", "1,2,3"));
+
+        Relay.HandleMessage(alice, """{"type":"magician_stone_removed","key":"1,2,3"}""");
+        Assert.False(Worlds.HasStone(StoneKind.Magician, "alpha", "1,2,3"));
     }
 
     [Fact]
