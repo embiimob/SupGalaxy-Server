@@ -118,6 +118,7 @@ public sealed class SupGalaxyServerHost : IAsyncDisposable
         app.MapGet("/info", () => Results.Json(InfoObject()));
         app.MapGet("/health", () => Results.Json(new { status = "ok", players = Players.Count }));
         app.MapPost("/connect", (Delegate)HandleConnectAsync);
+        app.MapGet("/world-sync/{token}", (Delegate)HandleWorldSyncDownloadAsync);
 
         _cts = new CancellationTokenSource();
         try
@@ -241,7 +242,11 @@ public sealed class SupGalaxyServerHost : IAsyncDisposable
         playerPortStart = Settings.PlayerPortStart,
         playerPortEnd = Settings.PlayerPortEnd,
         connect = "POST /connect",
+        features = SupportedFeatures(),
     };
+
+    private string[] SupportedFeatures() =>
+        Settings.EnableHttpWorldSync ? new[] { GameRelay.HttpWorldSyncFeature } : Array.Empty<string>();
 
     private void ConfigureKestrel(KestrelServerOptions k)
     {
@@ -298,6 +303,44 @@ public sealed class SupGalaxyServerHost : IAsyncDisposable
         return Results.Json(response, statusCode: response.StatusCode);
     }
 
+    /// <summary>
+    /// Serves a world snapshot offered with world_sync_http. The token is a single player's unguessable capability;
+    /// the body is the same JSON as the joined world_sync_chunk pieces, gzip compressed.
+    /// </summary>
+    private async Task HandleWorldSyncDownloadAsync(HttpContext ctx, string token)
+    {
+        var snapshot = Relay.BeginHttpSyncDownload(token);
+        if (snapshot == null)
+        {
+            ctx.Response.StatusCode = StatusCodes.Status404NotFound;
+            return;
+        }
+
+        var (gzip, _) = await snapshot.ConfigureAwait(false);
+        ctx.Response.Headers.CacheControl = "no-store";
+        ctx.Response.ContentType = "application/json; charset=utf-8";
+        var acceptsGzip = ctx.Request.Headers.AcceptEncoding.Any(v => v?.Contains("gzip", StringComparison.OrdinalIgnoreCase) == true);
+        try
+        {
+            if (acceptsGzip)
+            {
+                ctx.Response.Headers.ContentEncoding = "gzip";
+                ctx.Response.Headers.Vary = "Accept-Encoding";
+                ctx.Response.ContentLength = gzip.Length;
+                await ctx.Response.Body.WriteAsync(gzip, ctx.RequestAborted).ConfigureAwait(false);
+            }
+            else
+            {
+                await using var unzip = new System.IO.Compression.GZipStream(new MemoryStream(gzip), System.IO.Compression.CompressionMode.Decompress);
+                await unzip.CopyToAsync(ctx.Response.Body, ctx.RequestAborted).ConfigureAwait(false);
+            }
+        }
+        catch (Exception e) when (e is OperationCanceledException or IOException)
+        {
+            // Client went away; it reports world_sync_http_failed or the offer times out and falls back.
+        }
+    }
+
     /// <summary>Validates the player, creates the server side peer connection and returns the WebRTC answer.</summary>
     public async Task<ConnectResponse> ConnectAsync(ConnectRequest request, string? remoteAddress, CancellationToken cancellationToken = default)
     {
@@ -317,7 +360,8 @@ public sealed class SupGalaxyServerHost : IAsyncDisposable
             return ConnectResponse.Fail(403, "blocked", "You are blocked from this server.", name);
         }
 
-        var session = new PlayerSession(user!, request.World, remoteAddress);
+        var accepted = SupportedFeatures().Where(f => request.Features?.Contains(f, StringComparer.Ordinal) == true).ToList();
+        var session = new PlayerSession(user!, request.World, remoteAddress) { Features = accepted.ToHashSet(StringComparer.Ordinal) };
         if (!Players.TryAdd(session))
         {
             WriteLog($"Rejected duplicate user name '{user}' from {remoteAddress}.");
@@ -420,6 +464,7 @@ public sealed class SupGalaxyServerHost : IAsyncDisposable
                 Port = session.Port,
                 Answer = new SessionDescription { Type = "answer", Sdp = answer.sdp },
                 IceCandidates = outCandidates,
+                Features = request.Features == null ? null : accepted,
             };
         }
         catch (Exception e)
@@ -518,6 +563,7 @@ public sealed class SupGalaxyServerHost : IAsyncDisposable
             if (now - p.LastSeenUtc > IdleTimeout) Disconnect(p, "timed out (no messages)");
         }
         Relay.ExpireStaleImports();
+        Relay.ExpireHttpSyncs();
     }
 
     /// <summary>Idempotently tears down a session, frees its name and port and tells the other players.</summary>

@@ -28,7 +28,7 @@ namespace SupGalaxyServer;
 ///
 /// See <c>ClientIntegrationNotes.cs</c> for the exact protocol the SupGalaxy client must follow.
 /// </summary>
-public sealed class GameRelay
+public sealed partial class GameRelay
 {
     public const int ProtocolVersion = 1;
 
@@ -67,7 +67,7 @@ public sealed class GameRelay
     /// <summary>Messages only the server may originate. Dropped when a client sends them.</summary>
     internal static readonly HashSet<string> ServerOnlyTypes = new(StringComparer.Ordinal)
     {
-        "new_player", "remove_peer", "world_sync", "world_sync_start", "world_sync_chunk",
+        "new_player", "remove_peer", "world_sync", "world_sync_start", "world_sync_chunk", HttpSyncOfferType,
         // Media renegotiation must happen peer-to-peer (see p2p_signal), the server connection is data only.
         "renegotiation_offer", "renegotiation_answer",
     };
@@ -200,6 +200,8 @@ public sealed class GameRelay
         if (p.World != null && !worlds.Contains(p.World)) worlds.Add(p.World);
         foreach (var w in worlds) RecomputeAuthority(w, null);
 
+        DropHttpSyncs(p);
+
         lock (_importGate)
         {
             foreach (var key in _imports.Keys.Where(k => k.Sender == p.Username.ToLowerInvariant()).ToList())
@@ -285,6 +287,13 @@ public sealed class GameRelay
             // transactions itself and sends them as processedIds in world sync.
             case "processed_transaction_id":
             case "sync_processed_transaction":
+                return;
+
+            case HttpSyncDoneType:
+                CompleteHttpSync(from, Str(msg, "transactionId"), failed: false);
+                return;
+            case HttpSyncFailedType:
+                CompleteHttpSync(from, Str(msg, "transactionId"), failed: true);
                 return;
 
             case "request_world_sync":
@@ -677,8 +686,11 @@ public sealed class GameRelay
     }
 
     /// <summary>Streams the saved state of a world with SupGalaxy's world_sync_start / world_sync_chunk messages.</summary>
-    internal Task SendWorldSync(PlayerSession p, string world)
+    internal Task SendWorldSync(PlayerSession p, string world, bool allowHttp = true)
     {
+        if (allowHttp && _settings.EnableHttpWorldSync && p.Features.Contains(HttpWorldSyncFeature))
+            return OfferHttpSync(p, world);
+
         string? payload;
         long revision;
         // Taken atomically with BeginSync: every state update applied before this point is in the snapshot,

@@ -69,6 +69,18 @@ public sealed class ServerSettings
     /// <summary>Maximum characters buffered for one player's unfinished import transfers combined.</summary>
     public long MaxPendingImportCharsPerPlayer { get; set; } = 200L * 1024 * 1024;
 
+    /// <summary>
+    /// Lets clients that announce the "http_world_sync" feature download a world's saved state as one gzip
+    /// compressed HTTP response instead of hundreds of data-channel messages.
+    /// </summary>
+    public bool EnableHttpWorldSync { get; set; } = true;
+
+    /// <summary>Seconds a client has to start the HTTP world download before the server falls back to the data channel.</summary>
+    public int HttpWorldSyncFetchTimeoutSeconds { get; set; } = 30;
+
+    /// <summary>Seconds a client has to download and apply the HTTP world sync before held-back updates are released.</summary>
+    public int HttpWorldSyncTimeoutSeconds { get; set; } = 300;
+
     public int PlayerPortCount => PlayerPortEnd - PlayerPortStart + 1;
 
     /// <summary>Maximum simultaneous players: one even UDP port of the player range per player.</summary>
@@ -96,6 +108,9 @@ public sealed class ServerSettings
         if (MaxImportSize < 1024) errors.Add("Max import size must be at least 1024.");
         if (ImportTimeoutSeconds < 1) errors.Add("Import timeout must be at least 1 second.");
         if (MaxPendingImportsPerPlayer < 1) errors.Add("Max pending imports per player must be at least 1.");
+        if (HttpWorldSyncFetchTimeoutSeconds < 1) errors.Add("HTTP world sync fetch timeout must be at least 1 second.");
+        if (HttpWorldSyncTimeoutSeconds < HttpWorldSyncFetchTimeoutSeconds)
+            errors.Add("HTTP world sync timeout must be at least the fetch timeout.");
         if (MaxPendingImportCharsPerPlayer < MaxImportSize)
             errors.Add("Max pending import characters per player must be at least the max import size.");
         return errors;

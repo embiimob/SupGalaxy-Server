@@ -28,14 +28,19 @@
 //  ---------------------------------------------------------------------------------------------------------------
 //  2. HTTP API (main port, CORS enabled for any origin)
 //  ---------------------------------------------------------------------------------------------------------------
-//  GET  /info    -> { name, software, protocol, players, maxPlayers, playerPortStart, playerPortEnd }
+//  GET  /info    -> { name, software, protocol, players, maxPlayers, playerPortStart, playerPortEnd, features }
+//                   features lists optional capabilities the server has enabled, e.g. ["http_world_sync"].
 //                   Use it to show "server online, N/M players" next to the Connect button.
 //  GET  /health  -> { status: "ok", players }
 //  POST /connect  body (exactly the object connectToServer() already builds for the offer file):
 //                   { "world": worldName, "user": userName, "offer": { "type": "offer", "sdp": "..." },
-//                     "iceCandidates": [ RTCIceCandidateInit, ... ] }
+//                     "iceCandidates": [ RTCIceCandidateInit, ... ], "features": ["http_world_sync"] }
+//                 `features` is optional; omit it and the server behaves exactly as before.
 //                 200 -> { ok: true, serverName, protocol, user, world, port,
-//                          answer: { type: "answer", sdp: "..." }, iceCandidates: [ RTCIceCandidateInit, ... ] }
+//                          answer: { type: "answer", sdp: "..." }, iceCandidates: [ RTCIceCandidateInit, ... ],
+//                          features: [ accepted features ] (only present when the request sent `features`) }
+//  GET  /world-sync/{token} -> a world's saved state (see "Fast world sync" in section 5). gzip encoded,
+//                 404 for unknown / used / expired tokens.
 //                 Errors return { ok: false, code, error } (error = readable message), status/code is one of:
 //                   400 bad_request         invalid username / world / SDP
 //                   403 blocked             the server admin has blocked this username
@@ -166,6 +171,19 @@
 //  * world_sync payloads contain chunkDeltas, foreignBlockOrigins, processedIds, magicianStones, calligraphyStones
 //    and chests; world_sync_start also carries `revision`. World edits and imports applied after the snapshot was
 //    taken are held back and sent right after the last world_sync_chunk, so nothing is missed or overwritten.
+//  * Fast world sync (feature "http_world_sync", opt-in): send features: ["http_world_sync"] in POST /connect. The
+//    server then replaces world_sync_start / world_sync_chunk with one data-channel message
+//      { type: "world_sync_http", world, transactionId, revision, path: "/world-sync/<token>", bytes,
+//        compressedBytes, fetchTimeoutSeconds }
+//    Fetch `path` from the same base URL used for POST /connect (fetch decodes gzip itself). The JSON body is exactly
+//    the joined world_sync_chunk payload. Apply it like a completed world_sync, then send
+//      { type: "world_sync_http_done", transactionId }
+//    World edits/imports for that world are held back until _done (so nothing is missed or overwritten by the older
+//    snapshot). On any fetch/parse error send { type: "world_sync_http_failed", transactionId } and the server
+//    streams the world with world_sync_start / world_sync_chunk instead. If the download does not start within
+//    fetchTimeoutSeconds (30) or _done does not arrive within HttpWorldSyncTimeoutSeconds (300) the server falls
+//    back the same way, so a client must keep handling world_sync_start / world_sync_chunk. The token is a one-player
+//    secret; it may be retried until _done / _failed / disconnect.
 //  * Message size: a data-channel message may be at most 262144 bytes (SIPSorcery's limit, also advertised in the
 //    SDP). The server splits world_sync_chunk / ipfs_chunk_update_chunk pieces by encoded size (<= 64K chars) so
 //    they always fit; clients must keep their own messages (including JSON escaping) under that limit too.

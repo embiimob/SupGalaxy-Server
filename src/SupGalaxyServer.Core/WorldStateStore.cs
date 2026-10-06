@@ -171,6 +171,14 @@ public sealed class WorldStateStore
     }
 
     /// <summary>Current revision of a world (bumped by every applied edit), 0 for unknown worlds.</summary>
+    /// <summary>Changes whenever the whole store is replaced (Load / Reset), so (Generation, revision) identifies a snapshot.</summary>
+    public long Generation
+    {
+        get { lock (_gate) return _generation; }
+    }
+
+    private long _generation;
+
     public long GetRevision(string world)
     {
         lock (_gate) return _worlds.TryGetValue(world, out var w) ? w.Version : 0;
@@ -302,6 +310,7 @@ public sealed class WorldStateStore
         lock (_gate)
         {
             _worlds.Clear();
+            _generation++;
             foreach (var file in System.IO.Directory.EnumerateFiles(worldsDir, "*.json"))
             {
                 try
@@ -361,6 +370,7 @@ public sealed class WorldStateStore
         lock (_gate)
         {
             _worlds.Clear();
+            _generation++;
             if (_directory != null && System.IO.Directory.Exists(_directory))
                 System.IO.Directory.Delete(_directory, recursive: true);
             LastSaveUtc = null;

@@ -62,6 +62,9 @@ public sealed class PlayerSession
     public DateTime LastSeenUtc { get; internal set; }
     public string? IceState { get; internal set; }
 
+    /// <summary>Client capabilities announced in POST /connect (e.g. "http_world_sync").</summary>
+    public IReadOnlySet<string> Features { get; internal set; } = new HashSet<string>();
+
     /// <summary>Worlds whose saved state has already been streamed to this player.</summary>
     internal HashSet<string> SyncedWorlds { get; } = new();
 
