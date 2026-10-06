@@ -55,7 +55,7 @@ public sealed class ServerSettings
     public int MaxMessagesPerSecond { get; set; } = 600;
 
     /// <summary>Maximum re-assembled size (characters) of one imported Chunk Keyword / IPFS world update.</summary>
-    public int MaxImportSize { get; set; } = 16 * 1024 * 1024;
+    public int MaxImportSize { get; set; } = 100 * 1024 * 1024;
 
     /// <summary>An unfinished import transfer is discarded after this many seconds without a new chunk.</summary>
     public int ImportTimeoutSeconds { get; set; } = 120;

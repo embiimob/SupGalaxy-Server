@@ -170,6 +170,7 @@ public class PortAllocatorTests
         Assert.Equal(56556, s.PlayerPortEnd);
         Assert.Equal(1001, s.PlayerPortCount);
         Assert.Equal(501, s.MaxPlayers);
+        Assert.Equal(100 * 1024 * 1024, s.MaxImportSize);
         Assert.Empty(s.Validate());
     }
 }

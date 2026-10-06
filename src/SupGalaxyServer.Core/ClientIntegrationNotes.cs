@@ -151,7 +151,7 @@
 //      - Block changes follow shouldApplyIpfsUpdate: applied when the import's truncated date is valid and >= the
 //        date of the last import that wrote that block. foreignBlockOrigins, stones and chests: last import wins.
 //      - A transactionId already merged into a world is ignored (idempotent); merged ids are sent as processedIds.
-//      - Malformed JSON/fields, conflicting duplicate chunks, transfers over MaxImportSize (16M chars) and transfers
+//      - Malformed JSON/fields, conflicting duplicate chunks, transfers over MaxImportSize (100M chars) and transfers
 //        idle for ImportTimeoutSeconds (120s) are discarded without changing the world.
 //  * world_sync payloads contain chunkDeltas, foreignBlockOrigins, processedIds, magicianStones, calligraphyStones
 //    and chests; world_sync_start also carries `revision`. World edits and imports applied after the snapshot was

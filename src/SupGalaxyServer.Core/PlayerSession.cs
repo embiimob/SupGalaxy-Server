@@ -74,7 +74,7 @@ public sealed class PlayerSession
     private int _activeSyncs;
     private bool _syncBacklogOverflowed;
 
-    internal const long MaxSyncBacklogChars = 64L * 1024 * 1024;
+    internal const long MaxSyncBacklogChars = 128L * 1024 * 1024;
 
     internal bool IsSyncing
     {
