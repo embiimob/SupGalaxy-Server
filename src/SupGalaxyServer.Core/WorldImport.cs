@@ -210,7 +210,7 @@ public sealed class WorldImport
             if (c.OwnershipNeutral is { } n) o["ownershipNeutral"] = n;
             deltas.Add(o);
         }
-        if (!IsObjectForm) return deltas.ToJsonString();
+        if (!IsObjectForm) return WireFormat.Serialize(deltas);
 
         var root = new JsonObject { ["deltas"] = deltas };
         if (ForeignOrigins.Count > 0)
@@ -218,7 +218,7 @@ public sealed class WorldImport
         if (MagicianStones.Count > 0) root["magicianStones"] = ToObject(MagicianStones);
         if (CalligraphyStones.Count > 0) root["calligraphyStones"] = ToObject(CalligraphyStones);
         if (Chests.Count > 0) root["chests"] = ToObject(Chests);
-        return root.ToJsonString();
+        return WireFormat.Serialize(root);
     }
 
     private static JsonObject ToObject(Dictionary<string, JsonNode> map)

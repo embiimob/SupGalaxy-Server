@@ -70,7 +70,8 @@ internal sealed class RtcTestClient : IDisposable
         return (client, response);
     }
 
-    public void Send(object message) => _dc!.send(System.Text.Json.JsonSerializer.Serialize(message));
+    // Same escaping as the browser's JSON.stringify.
+    public void Send(object message) => _dc!.send(System.Text.Json.JsonSerializer.Serialize(message, WireFormat.Options));
 
     public async Task<JsonObject> WaitFor(string type, Func<JsonObject, bool>? predicate = null, int timeoutMs = 10000)
     {

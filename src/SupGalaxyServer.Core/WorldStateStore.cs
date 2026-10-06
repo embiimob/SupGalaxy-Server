@@ -383,7 +383,7 @@ public sealed class WorldStateStore
     private static string Serialize(WorldData w, bool includeHeader)
     {
         var buffer = new ArrayBufferWriter<byte>();
-        using (var writer = new Utf8JsonWriter(buffer))
+        using (var writer = new Utf8JsonWriter(buffer, WireFormat.WriterOptions))
         {
             writer.WriteStartObject();
             if (includeHeader)

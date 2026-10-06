@@ -32,8 +32,11 @@ public sealed class GameRelay
 {
     public const int ProtocolVersion = 1;
 
-    /// <summary>Same chunk size SupGalaxy uses in sendWorldStateAsync.</summary>
-    public const int SyncChunkSize = 131072;
+    /// <summary>
+    /// Max characters per world_sync_chunk / ipfs_chunk_update_chunk piece (SupGalaxy uses 131072). Pieces are also
+    /// capped by encoded size (<see cref="WireFormat.Split"/>) so a message never exceeds the data-channel limit.
+    /// </summary>
+    public const int SyncChunkSize = 65536;
 
     private const ulong SyncHighWaterMark = 1024 * 1024;
     private const ulong CongestedThreshold = 512 * 1024;
@@ -248,7 +251,7 @@ public sealed class GameRelay
         }
 
         // Compared in canonical form because the authority's JS re-serializes what it forwards.
-        var canonical = msg.ToJsonString();
+        var canonical = WireFormat.Serialize(msg);
         if (isAuthority)
         {
             if (IsEcho(from, canonical)) return;
@@ -526,9 +529,7 @@ public sealed class GameRelay
                     ["fromAddress"] = transfer.FromAddress,
                     ["timestamp"] = transfer.Timestamp,
                 };
-                var chunks = new List<string>();
-                for (int i = 0; i < json.Length; i += SyncChunkSize)
-                    chunks.Add(json.Substring(i, Math.Min(SyncChunkSize, json.Length - i)));
+                var chunks = WireFormat.Split(json, SyncChunkSize);
                 start["total"] = chunks.Count;
                 messages.Add(Json(start));
                 for (int i = 0; i < chunks.Count; i++)
@@ -689,9 +690,7 @@ public sealed class GameRelay
             p.BeginSync();
         }
 
-        var chunks = new List<string>();
-        for (int i = 0; i < payload.Length; i += SyncChunkSize)
-            chunks.Add(payload.Substring(i, Math.Min(SyncChunkSize, payload.Length - i)));
+        var chunks = WireFormat.Split(payload, SyncChunkSize);
         var transactionId = $"world_sync_{p.Username}_{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}";
 
         return Task.Run(async () =>
@@ -704,7 +703,10 @@ public sealed class GameRelay
                         ["type"] = "world_sync_start", ["world"] = world, ["total"] = chunks.Count, ["transactionId"] = transactionId,
                         ["revision"] = revision,
                     })))
+                {
+                    SyncAborted(p, world, 0, chunks.Count);
                     return;
+                }
                 for (int i = 0; i < chunks.Count; i++)
                 {
                     while (p.Transport is { IsOpen: true } t && t.BufferedAmount > SyncHighWaterMark && !p.IsClosed)
@@ -718,7 +720,10 @@ public sealed class GameRelay
                             ["chunk"] = chunks[i],
                             ["total"] = chunks.Count,
                         })))
+                    {
+                        SyncAborted(p, world, i, chunks.Count);
                         return;
+                    }
                 }
                 sent = true;
                 _log?.Invoke($"Sent saved state of world '{world}' (revision {revision}) to {p.Username} ({chunks.Count} chunk(s)).");
@@ -731,7 +736,15 @@ public sealed class GameRelay
         });
     }
 
-    internal static string Json(JsonObject o) => o.ToJsonString();
+    private void SyncAborted(PlayerSession p, string world, int index, int total)
+    {
+        if (p.IsClosed || p.State != PlayerState.Connected) return;
+        // Let the next request_world_sync / world entry send it again.
+        lock (p.SyncedWorlds) p.SyncedWorlds.Remove(world);
+        _log?.Invoke($"World sync of '{world}' to {p.Username} failed at chunk {index + 1}/{total}.");
+    }
+
+    internal static string Json(JsonObject o) => WireFormat.Serialize(o);
 
     private static string? Str(JsonObject o, string name) =>
         o.TryGetPropertyValue(name, out var n) && n is JsonValue v && v.TryGetValue<string>(out var s) ? s : null;

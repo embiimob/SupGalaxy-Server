@@ -166,6 +166,9 @@
 //  * world_sync payloads contain chunkDeltas, foreignBlockOrigins, processedIds, magicianStones, calligraphyStones
 //    and chests; world_sync_start also carries `revision`. World edits and imports applied after the snapshot was
 //    taken are held back and sent right after the last world_sync_chunk, so nothing is missed or overwritten.
+//  * Message size: a data-channel message may be at most 262144 bytes (SIPSorcery's limit, also advertised in the
+//    SDP). The server splits world_sync_chunk / ipfs_chunk_update_chunk pieces by encoded size (<= 64K chars) so
+//    they always fit; clients must keep their own messages (including JSON escaping) under that limit too.
 //
 //  ---------------------------------------------------------------------------------------------------------------
 //  6. PROXIMITY VOICE / VIDEO CHAT
