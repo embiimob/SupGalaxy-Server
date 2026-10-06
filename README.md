@@ -14,6 +14,7 @@ A dedicated WebRTC host for [SupGalaxy](https://github.com/embiimob/SupGalaxy). 
   - **Kick** a player.
   - **Block** a player by name, and a list of blocked users with **Unblock**.
   - Only one session per username (case-insensitive). A second login with the same name gets `409 name_in_use`.
+- **Shared discoveries**: Chunk Keyword / IPFS imports sent by a client (`ipfs_chunk_from_client_*`) are re-assembled, validated, saved per world and sent to the other players in that world; players who join later get them in the initial world sync. Limits: `MaxImportSize`, `ImportTimeoutSeconds`, `MaxPendingImportsPerPlayer` in `settings.json`.
 - **Saves**: an incremental save runs every 10 minutes (configurable), plus a save on shutdown. On restart the server continues from the last save. **Reset saved session…** discards it after a warning.
 - **Low lag**: high-frequency updates are dropped for congested receivers, there are per-player rate limits, and voice/video goes directly between nearby players (the server relays only their `p2p_signal` messages).
 

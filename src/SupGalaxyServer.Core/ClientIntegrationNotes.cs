@@ -140,6 +140,22 @@
 //  * World edits that the server persists and replays in world sync: block_change, batch_block_change,
 //    block_place, block_break, magician_stone_placed/removed, calligraphy_stone_placed/removed. Keep their current
 //    field names (world, x, y, z, blockId / replacementBlockId, originSeed, stoneData, key).
+//  * Chunk Keyword / IPFS imports: keep sending ipfs_chunk_from_client_start / ipfs_chunk_from_client_chunk exactly
+//    as applyChunkUpdates() does today, and include `world: worldName` in the start message (without it the server
+//    uses the world you are in). The server re-assembles the transfer per (sender, transactionId), validates it, merges
+//    it into the saved world and sends it to the OTHER players in that world as ipfs_chunk_update_start /
+//    ipfs_chunk_update_chunk ({ world, username: <importer>, transactionId, fromAddress, timestamp, total } / index,
+//    chunk). Apply those with the existing `!isHost` handlers. The raw ipfs_chunk_from_client_* messages are never
+//    relayed. Rules:
+//      - Only chunks whose key prefix matches the world are kept (`#` prefixes are stripped); others are ignored.
+//      - Block changes follow shouldApplyIpfsUpdate: applied when the import's truncated date is valid and >= the
+//        date of the last import that wrote that block. foreignBlockOrigins, stones and chests: last import wins.
+//      - A transactionId already merged into a world is ignored (idempotent); merged ids are sent as processedIds.
+//      - Malformed JSON/fields, conflicting duplicate chunks, transfers over MaxImportSize (16M chars) and transfers
+//        idle for ImportTimeoutSeconds (120s) are discarded without changing the world.
+//  * world_sync payloads contain chunkDeltas, foreignBlockOrigins, processedIds, magicianStones, calligraphyStones
+//    and chests; world_sync_start also carries `revision`. World edits and imports applied after the snapshot was
+//    taken are held back and sent right after the last world_sync_chunk, so nothing is missed or overwritten.
 //
 //  ---------------------------------------------------------------------------------------------------------------
 //  6. PROXIMITY VOICE / VIDEO CHAT

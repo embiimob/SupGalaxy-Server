@@ -19,6 +19,12 @@ namespace SupGalaxyServer;
 ///  * Persisted     - block_change / batch_block_change / block_place / block_break and stone messages are
 ///                    applied to <see cref="WorldStateStore"/> so the world survives restarts and new players
 ///                    receive it with world_sync_start / world_sync_chunk when they enter a world.
+///  * Imports       - Chunk Keyword / IPFS world updates a client discovered (ipfs_chunk_from_client_start/_chunk)
+///                    are re-assembled per sender and transaction, validated, merged into <see cref="WorldStateStore"/>
+///                    and fanned out as ipfs_chunk_update_start/_chunk to the other players in that world.
+///
+/// World-state updates and world sync snapshots are ordered by one gate: a snapshot is taken atomically with
+/// starting the sync, and updates applied after it are held back per player until the snapshot has been sent.
 ///
 /// See <c>ClientIntegrationNotes.cs</c> for the exact protocol the SupGalaxy client must follow.
 /// </summary>
@@ -67,7 +73,44 @@ public sealed class GameRelay
     private readonly WorldStateStore _worlds;
     private readonly ServerSettings _settings;
     private readonly Action<string>? _log;
+    /// <summary>Messages that change persisted world state. Applied and delivered under <see cref="_stateGate"/>.</summary>
+    internal static readonly HashSet<string> StateTypes = new(StringComparer.Ordinal)
+    {
+        "block_change", "batch_block_change", "block_place", "block_break",
+        "magician_stone_placed", "calligraphy_stone_placed", "magician_stone_removed", "calligraphy_stone_removed",
+    };
+
+    public const string ImportStartType = "ipfs_chunk_from_client_start";
+    public const string ImportChunkType = "ipfs_chunk_from_client_chunk";
+    public const string ImportUpdateStartType = "ipfs_chunk_update_start";
+    public const string ImportUpdateChunkType = "ipfs_chunk_update_chunk";
+    private const int MaxTransactionIdLength = 256;
+    private const int MaxWorldNameLength = 256;
+
     private readonly object _authorityGate = new();
+    private readonly object _stateGate = new();
+
+    private sealed class ImportTransfer
+    {
+        public required string Sender { get; init; }
+        public required string TransactionId { get; init; }
+        public required string World { get; init; }
+        public required string?[] Chunks { get; init; }
+        public string? FromAddress { get; init; }
+        public double? Timestamp { get; init; }
+        public int Received;
+        public long Chars;
+        public long LastActivity;
+    }
+
+    private readonly object _importGate = new();
+    private readonly Dictionary<(string Sender, string TransactionId), ImportTransfer> _imports = new();
+
+    /// <summary>Monotonic clock in milliseconds, replaceable by tests.</summary>
+    internal Func<long> Clock { get; set; } = () => Environment.TickCount64;
+
+    /// <summary>Raised after an imported world update was merged into the store (world name).</summary>
+    public event Action<string>? WorldImported;
     private readonly Dictionary<string, string> _authorities = new(StringComparer.Ordinal);
 
     // Recently relayed player messages. SupGalaxy's host code re-forwards messages it receives to its peers;
@@ -152,6 +195,12 @@ public sealed class GameRelay
         }
         if (p.World != null && !worlds.Contains(p.World)) worlds.Add(p.World);
         foreach (var w in worlds) RecomputeAuthority(w, null);
+
+        lock (_importGate)
+        {
+            foreach (var key in _imports.Keys.Where(k => k.Sender == p.Username.ToLowerInvariant()).ToList())
+                _imports.Remove(key);
+        }
     }
 
     public void HandleMessage(PlayerSession from, string raw)
@@ -176,6 +225,18 @@ public sealed class GameRelay
         var type = Str(msg, "type");
         if (type == null || ServerOnlyTypes.Contains(type) || type.StartsWith("server_", StringComparison.Ordinal)) return;
 
+        // Imports are re-assembled and fanned out by the server; the raw client messages are never relayed.
+        if (type == ImportStartType)
+        {
+            HandleImportStart(from, msg);
+            return;
+        }
+        if (type == ImportChunkType)
+        {
+            HandleImportChunk(from, msg);
+            return;
+        }
+
         // Identity enforcement: a player can only speak for itself. A world authority legitimately sends
         // results on behalf of other players (e.g. block_break with username = breaker), so it is exempt.
         bool modified = false;
@@ -196,6 +257,18 @@ public sealed class GameRelay
             RememberRelayed(from, canonical);
         }
 
+        if (StateTypes.Contains(type))
+        {
+            lock (_stateGate) Dispatch(from, msg, type, raw, canonical, modified, state: true);
+        }
+        else
+        {
+            Dispatch(from, msg, type, raw, canonical, modified, state: false);
+        }
+    }
+
+    private void Dispatch(PlayerSession from, JsonObject msg, string type, string raw, string canonical, bool modified, bool state)
+    {
         var world = Str(msg, "world");
 
         switch (type)
@@ -280,18 +353,187 @@ public sealed class GameRelay
             return;
         }
 
-        Broadcast(from, raw, WorldScopedTypes.Contains(type) ? world ?? from.World : null, DroppableTypes.Contains(type));
+        Broadcast(from, raw, WorldScopedTypes.Contains(type) ? world ?? from.World : null, DroppableTypes.Contains(type), state);
     }
 
-    private void Broadcast(PlayerSession from, string raw, string? world, bool droppable)
+    private void Broadcast(PlayerSession from, string raw, string? world, bool droppable, bool state)
     {
         foreach (var p in _players.Connected())
         {
             if (ReferenceEquals(p, from)) continue;
             if (world != null && p.World != null && p.World != world) continue;
             if (droppable && p.Transport is { } t && t.BufferedAmount > CongestedThreshold) continue;
-            p.Send(raw);
+            if (state) p.SendStateUpdate(raw);
+            else p.Send(raw);
         }
+    }
+
+    private void HandleImportStart(PlayerSession from, JsonObject msg)
+    {
+        var tx = Str(msg, "transactionId");
+        var world = Str(msg, "world") ?? from.World;
+        var total = Long(msg, "total");
+        long maxChunks = Math.Max(1, _settings.MaxImportSize / 1024);
+        if (string.IsNullOrEmpty(tx) || tx.Length > MaxTransactionIdLength || string.IsNullOrEmpty(world) || world.Length > MaxWorldNameLength
+            || total is not { } t || t < 1 || t > maxChunks || Num(msg, "total") != t)
+        {
+            _log?.Invoke($"Rejected world import start from {from.Username}: invalid transactionId, world or total.");
+            return;
+        }
+        if (_worlds.IsImportProcessed(world, tx)) return; // Already merged: repeated delivery is a no-op.
+
+        var now = Clock();
+        var key = (from.Username.ToLowerInvariant(), tx);
+        lock (_importGate)
+        {
+            ExpireImportsLocked(now);
+            if (_imports.ContainsKey(key)) return; // Duplicate start.
+            if (_imports.Keys.Count(k => k.Sender == key.Item1) >= _settings.MaxPendingImportsPerPlayer)
+            {
+                _log?.Invoke($"Rejected world import {tx} from {from.Username}: too many unfinished imports.");
+                return;
+            }
+            _imports[key] = new ImportTransfer
+            {
+                Sender = key.Item1,
+                TransactionId = tx,
+                World = world,
+                Chunks = new string?[t],
+                FromAddress = Str(msg, "fromAddress"),
+                Timestamp = Num(msg, "timestamp"),
+                LastActivity = now,
+            };
+        }
+    }
+
+    private void HandleImportChunk(PlayerSession from, JsonObject msg)
+    {
+        var tx = Str(msg, "transactionId");
+        if (tx == null) return;
+        var key = (from.Username.ToLowerInvariant(), tx);
+        var now = Clock();
+        ImportTransfer? complete = null;
+        lock (_importGate)
+        {
+            ExpireImportsLocked(now);
+            if (!_imports.TryGetValue(key, out var transfer)) return; // Unknown, expired, rejected or already merged.
+
+            var chunk = Str(msg, "chunk");
+            var index = Long(msg, "index");
+            var total = msg.ContainsKey("total") ? Long(msg, "total") : transfer.Chunks.Length;
+            if (chunk == null || index is not { } i || Num(msg, "index") != i || i < 0 || i >= transfer.Chunks.Length || total != transfer.Chunks.Length)
+            {
+                _imports.Remove(key);
+                _log?.Invoke($"Rejected world import {tx} from {from.Username}: malformed chunk.");
+                return;
+            }
+            if (transfer.Chunks[i] is { } existing)
+            {
+                if (existing == chunk) return; // Duplicate chunk.
+                _imports.Remove(key);
+                _log?.Invoke($"Rejected world import {tx} from {from.Username}: conflicting copies of chunk {i}.");
+                return;
+            }
+            if (transfer.Chars + chunk.Length > _settings.MaxImportSize)
+            {
+                _imports.Remove(key);
+                _log?.Invoke($"Rejected world import {tx} from {from.Username}: larger than {_settings.MaxImportSize} characters.");
+                return;
+            }
+            transfer.Chunks[i] = chunk;
+            transfer.Chars += chunk.Length;
+            transfer.Received++;
+            transfer.LastActivity = now;
+            if (transfer.Received == transfer.Chunks.Length)
+            {
+                _imports.Remove(key);
+                complete = transfer;
+            }
+        }
+        if (complete != null) CompleteImport(from, complete);
+    }
+
+    private void CompleteImport(PlayerSession from, ImportTransfer transfer)
+    {
+        var payload = string.Concat(transfer.Chunks);
+        var import = WorldImport.Parse(transfer.World, payload, out var error);
+        if (import == null)
+        {
+            _log?.Invoke($"Rejected world import {transfer.TransactionId} from {from.Username}: {error}.");
+            return;
+        }
+        if (import.ForeignWorldChunks > 0)
+            _log?.Invoke($"World import {transfer.TransactionId} from {from.Username}: ignored {import.ForeignWorldChunks} chunk(s) of other worlds.");
+
+        int recipients = 0;
+        lock (_stateGate)
+        {
+            var applied = _worlds.ApplyImport(transfer.World, transfer.TransactionId, WorldImport.ComputeTruncatedDate(transfer.Timestamp), import);
+            if (applied == null) return; // Already merged.
+            if (!applied.IsEmpty)
+            {
+                var json = applied.ToJson();
+                var messages = new List<string>();
+                var start = new JsonObject
+                {
+                    ["type"] = ImportUpdateStartType,
+                    ["world"] = transfer.World,
+                    ["username"] = from.Username,
+                    ["transactionId"] = transfer.TransactionId,
+                    ["fromAddress"] = transfer.FromAddress,
+                    ["timestamp"] = transfer.Timestamp,
+                };
+                var chunks = new List<string>();
+                for (int i = 0; i < json.Length; i += SyncChunkSize)
+                    chunks.Add(json.Substring(i, Math.Min(SyncChunkSize, json.Length - i)));
+                start["total"] = chunks.Count;
+                messages.Add(Json(start));
+                for (int i = 0; i < chunks.Count; i++)
+                {
+                    messages.Add(Json(new JsonObject
+                    {
+                        ["type"] = ImportUpdateChunkType,
+                        ["world"] = transfer.World,
+                        ["username"] = from.Username,
+                        ["transactionId"] = transfer.TransactionId,
+                        ["index"] = i,
+                        ["chunk"] = chunks[i],
+                        ["total"] = chunks.Count,
+                    }));
+                }
+                foreach (var p in _players.Connected())
+                {
+                    if (ReferenceEquals(p, from) || p.World != transfer.World) continue;
+                    foreach (var m in messages) p.SendStateUpdate(m);
+                    recipients++;
+                }
+            }
+        }
+        _log?.Invoke($"Merged world import {transfer.TransactionId} from {from.Username} into '{transfer.World}' ({transfer.Chunks.Length} chunk(s), sent to {recipients} player(s)).");
+        WorldImported?.Invoke(transfer.World);
+    }
+
+    /// <summary>Discards unfinished import transfers that have been idle longer than the import timeout.</summary>
+    public int ExpireStaleImports()
+    {
+        lock (_importGate) return ExpireImportsLocked(Clock());
+    }
+
+    internal int PendingImportCount
+    {
+        get { lock (_importGate) return _imports.Count; }
+    }
+
+    private int ExpireImportsLocked(long now)
+    {
+        long timeoutMs = _settings.ImportTimeoutSeconds * 1000L;
+        var stale = _imports.Where(kv => now - kv.Value.LastActivity > timeoutMs).Select(kv => kv.Key).ToList();
+        foreach (var k in stale)
+        {
+            _log?.Invoke($"Discarded unfinished world import {k.TransactionId} from {k.Sender}: timed out.");
+            _imports.Remove(k);
+        }
+        return stale.Count;
     }
 
     private void RememberRelayed(PlayerSession from, string raw)
@@ -377,8 +619,16 @@ public sealed class GameRelay
     /// <summary>Streams the saved state of a world with SupGalaxy's world_sync_start / world_sync_chunk messages.</summary>
     internal Task SendWorldSync(PlayerSession p, string world)
     {
-        var payload = _worlds.BuildSyncPayload(world);
-        if (payload == null) return Task.CompletedTask;
+        string? payload;
+        long revision;
+        // Taken atomically with BeginSync: every state update applied before this point is in the snapshot,
+        // every later one is held back for this player until the snapshot has been streamed.
+        lock (_stateGate)
+        {
+            payload = _worlds.BuildSyncPayload(world, out revision);
+            if (payload == null) return Task.CompletedTask;
+            p.BeginSync();
+        }
 
         var chunks = new List<string>();
         for (int i = 0; i < payload.Length; i += SyncChunkSize)
@@ -387,24 +637,38 @@ public sealed class GameRelay
 
         return Task.Run(async () =>
         {
-            if (!p.Send(Json(new JsonObject { ["type"] = "world_sync_start", ["world"] = world, ["total"] = chunks.Count, ["transactionId"] = transactionId })))
-                return;
-            for (int i = 0; i < chunks.Count; i++)
+            bool sent = false;
+            try
             {
-                while (p.Transport is { IsOpen: true } t && t.BufferedAmount > SyncHighWaterMark && !p.IsClosed)
-                    await Task.Delay(10).ConfigureAwait(false);
                 if (!p.Send(Json(new JsonObject
                     {
-                        ["type"] = "world_sync_chunk",
-                        ["world"] = world,
-                        ["transactionId"] = transactionId,
-                        ["index"] = i,
-                        ["chunk"] = chunks[i],
-                        ["total"] = chunks.Count,
+                        ["type"] = "world_sync_start", ["world"] = world, ["total"] = chunks.Count, ["transactionId"] = transactionId,
+                        ["revision"] = revision,
                     })))
                     return;
+                for (int i = 0; i < chunks.Count; i++)
+                {
+                    while (p.Transport is { IsOpen: true } t && t.BufferedAmount > SyncHighWaterMark && !p.IsClosed)
+                        await Task.Delay(10).ConfigureAwait(false);
+                    if (!p.Send(Json(new JsonObject
+                        {
+                            ["type"] = "world_sync_chunk",
+                            ["world"] = world,
+                            ["transactionId"] = transactionId,
+                            ["index"] = i,
+                            ["chunk"] = chunks[i],
+                            ["total"] = chunks.Count,
+                        })))
+                        return;
+                }
+                sent = true;
+                _log?.Invoke($"Sent saved state of world '{world}' (revision {revision}) to {p.Username} ({chunks.Count} chunk(s)).");
             }
-            _log?.Invoke($"Sent saved state of world '{world}' to {p.Username} ({chunks.Count} chunk(s)).");
+            finally
+            {
+                // Held back updates follow the snapshot. If too many piled up they were dropped; resend a fresh snapshot.
+                if (!p.EndSync() && sent && !p.IsClosed) _ = SendWorldSync(p, world);
+            }
         });
     }
 

@@ -49,6 +49,21 @@ public sealed class SupGalaxyServerHost : IAsyncDisposable
         Ports = new PortAllocator(Settings.PlayerPortStart, Settings.PlayerPortEnd, evenOnly: true);
         Relay = new GameRelay(Players, Worlds, Settings, WriteLog);
         Relay.AuthorityChanged += (_, _) => PlayersChanged?.Invoke();
+        Relay.WorldImported += _ => ScheduleImportSave();
+    }
+
+    private int _importSaveQueued;
+
+    /// <summary>Imported discoveries are saved within a few seconds instead of waiting for the next incremental save.</summary>
+    private void ScheduleImportSave()
+    {
+        if (Interlocked.Exchange(ref _importSaveQueued, 1) == 1) return;
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+            Interlocked.Exchange(ref _importSaveQueued, 0);
+            SaveNowSafe("Import save");
+        });
     }
 
     public ServerSettings Settings { get; }
@@ -502,6 +517,7 @@ public sealed class SupGalaxyServerHost : IAsyncDisposable
         {
             if (now - p.LastSeenUtc > IdleTimeout) Disconnect(p, "timed out (no messages)");
         }
+        Relay.ExpireStaleImports();
     }
 
     /// <summary>Idempotently tears down a session, frees its name and port and tells the other players.</summary>

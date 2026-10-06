@@ -54,6 +54,15 @@ public sealed class ServerSettings
     /// <summary>Maximum number of data channel messages a single player may send per second.</summary>
     public int MaxMessagesPerSecond { get; set; } = 600;
 
+    /// <summary>Maximum re-assembled size (characters) of one imported Chunk Keyword / IPFS world update.</summary>
+    public int MaxImportSize { get; set; } = 16 * 1024 * 1024;
+
+    /// <summary>An unfinished import transfer is discarded after this many seconds without a new chunk.</summary>
+    public int ImportTimeoutSeconds { get; set; } = 120;
+
+    /// <summary>Maximum unfinished import transfers per player.</summary>
+    public int MaxPendingImportsPerPlayer { get; set; } = 4;
+
     public int PlayerPortCount => PlayerPortEnd - PlayerPortStart + 1;
 
     /// <summary>Maximum simultaneous players: one even UDP port of the player range per player.</summary>
@@ -78,6 +87,9 @@ public sealed class ServerSettings
         if (SaveIntervalMinutes < 1) errors.Add("Save interval must be at least 1 minute.");
         if (MaxMessageSize < 1024) errors.Add("Max message size must be at least 1024.");
         if (MaxMessagesPerSecond < 1) errors.Add("Max messages per second must be at least 1.");
+        if (MaxImportSize < 1024) errors.Add("Max import size must be at least 1024.");
+        if (ImportTimeoutSeconds < 1) errors.Add("Import timeout must be at least 1 second.");
+        if (MaxPendingImportsPerPlayer < 1) errors.Add("Max pending imports per player must be at least 1.");
         return errors;
     }
 
