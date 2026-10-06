@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Allows building (not running) the Windows GUI on Linux/macOS build machines. -->
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <RootNamespace>SupGalaxyServer.Gui</RootNamespace>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\SupGalaxyServer.Core\SupGalaxyServer.Core.csproj" />
+  </ItemGroup>
+
+</Project>
