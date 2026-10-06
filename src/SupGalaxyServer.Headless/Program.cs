@@ -78,7 +78,7 @@ _ = Task.Run(() =>
                 var players = host.GetPlayers(arg);
                 Console.WriteLine($"{players.Length} player(s):");
                 foreach (var p in players)
-                    Console.WriteLine($"  {p.Username,-24} {p.State,-10} world={p.World} port={p.Port} from={p.RemoteAddress}{(p.IsWorldAuthority ? " [authority]" : "")}");
+                    Console.WriteLine($"  {p.Username,-24} {p.State,-10} world={p.World} port={p.Port} from={p.RemoteAddress}");
                 break;
             case "info":
                 var info = host.GetPlayers().FirstOrDefault(p => string.Equals(p.Username, arg, StringComparison.OrdinalIgnoreCase));

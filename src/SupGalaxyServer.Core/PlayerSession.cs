@@ -45,7 +45,7 @@ public sealed class PlayerSession
     public string? RemoteAddress { get; }
     public DateTime ConnectedAtUtc { get; }
 
-    /// <summary>Monotonic join order, used to pick the oldest player as world authority.</summary>
+    /// <summary>Monotonic join order.</summary>
     public long JoinSequence { get; internal set; }
 
     public volatile PlayerState State = PlayerState.Connecting;
@@ -60,10 +60,19 @@ public sealed class PlayerSession
     public double Y { get; internal set; }
     public double Z { get; internal set; }
     public DateTime LastSeenUtc { get; internal set; }
+
+    /// <summary>True once the player has reported a position (player_move) in its current world.</summary>
+    public bool HasPosition { get; internal set; }
     public string? IceState { get; internal set; }
 
     /// <summary>Worlds whose saved state has already been streamed to this player.</summary>
     internal HashSet<string> SyncedWorlds { get; } = new();
+
+    // Per-player state of the server-side game rules (see Rules/WorldRules.cs).
+    internal object RuleGate { get; } = new();
+    internal long LastPvpHitMs;
+    internal long LastLavaDamageMs;
+    internal Dictionary<string, long> LastClientDamageMs { get; } = new(StringComparer.OrdinalIgnoreCase);
 
     public long MessagesIn => Interlocked.Read(ref _messagesIn);
     public long MessagesOut => Interlocked.Read(ref _messagesOut);
@@ -114,9 +123,9 @@ public sealed class PlayerSession
         }
     }
 
-    public PlayerInfo ToInfo(bool isAuthority) => new(
+    public PlayerInfo ToInfo() => new(
         Username, World, X, Y, Z, State, Port, RemoteAddress, ConnectedAtUtc, LastSeenUtc,
-        MessagesIn, MessagesOut, BytesIn, BytesOut, IceState, isAuthority);
+        MessagesIn, MessagesOut, BytesIn, BytesOut, IceState);
 }
 
 /// <summary>Immutable snapshot of a player for display in the GUI / console.</summary>
@@ -135,5 +144,4 @@ public sealed record PlayerInfo(
     long MessagesOut,
     long BytesIn,
     long BytesOut,
-    string? IceState,
-    bool IsWorldAuthority);
+    string? IceState);

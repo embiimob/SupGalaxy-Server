@@ -160,7 +160,6 @@ public class EndToEndTests : IAsyncLifetime
         using var _a = alice;
         Assert.Equal(HttpStatusCode.OK, r1.StatusCode);
         await alice.WaitFor("server_welcome");
-        await alice.WaitFor("server_authority", m => (string?)m["username"] == "alice");
 
         var (bob, r2) = await RtcTestClient.ConnectAsync(_http, "bob", "alpha");
         using var _b = bob;
@@ -173,21 +172,21 @@ public class EndToEndTests : IAsyncLifetime
         var chat = await alice.WaitFor("chat");
         Assert.Equal("hello alice", (string?)chat["message"]);
 
-        // Block placement by the authority is persisted and later synced to new players.
-        alice.Send(new { type = "block_change", world = "alpha", wx = 3, wy = 10, wz = 4, bid = 42, username = "alice" });
-        await bob.WaitFor("block_change");
-        Assert.Equal(42, _host.Worlds.GetBlock("alpha", 3, 10, 4));
+        // Block placement is decided by the server's game rules, persisted and later synced to new players.
+        alice.Send(new { type = "request_block_place", world = "alpha", x = 3, y = 200, z = 4, blockId = 100, username = "alice" });
+        await bob.WaitFor("block_place", m => (string?)m["username"] == "alice");
+        await alice.WaitFor("remove_from_inventory");
+        Assert.Equal(100, _host.Worlds.GetBlock("alpha", 3, 200, 4));
 
         var players = _host.GetPlayers();
         Assert.Equal(new[] { "alice", "bob" }, players.Select(p => p.Username));
         Assert.All(players, p => Assert.InRange(p.Port, _host.Settings.PlayerPortStart, _host.Settings.PlayerPortEnd));
-        Assert.True(players.Single(p => p.Username == "alice").IsWorldAuthority);
 
         var (carol, r3) = await RtcTestClient.ConnectAsync(_http, "carol", "alpha");
         using var _c = carol;
         Assert.Equal(HttpStatusCode.OK, r3.StatusCode);
         var sync = await carol.WaitFor("world_sync_chunk");
-        Assert.Contains("\"b\":42", (string)sync["chunk"]!);
+        Assert.Contains("\"b\":100", (string)sync["chunk"]!);
     }
 
     [Fact]
@@ -256,8 +255,8 @@ public class EndToEndTests : IAsyncLifetime
         using (alice)
         {
             await alice.WaitFor("server_welcome");
-            alice.Send(new { type = "block_change", world = "alpha", wx = 1, wy = 2, wz = 3, bid = 77 });
-            await RelayTestBase.Eventually(() => _host.Worlds.GetBlock("alpha", 1, 2, 3) == 77);
+            alice.Send(new { type = "request_block_place", world = "alpha", x = 1, y = 200, z = 3, blockId = 100 });
+            await RelayTestBase.Eventually(() => _host.Worlds.GetBlock("alpha", 1, 200, 3) == 100);
         }
 
         await _host.StopAsync();
@@ -265,7 +264,8 @@ public class EndToEndTests : IAsyncLifetime
         await restarted.StartAsync();
         try
         {
-            Assert.Equal(77, restarted.Worlds.GetBlock("alpha", 1, 2, 3));
+            Assert.Equal(100, restarted.Worlds.GetBlock("alpha", 1, 200, 3));
+            Assert.Equal("alice", restarted.Worlds.GetClaim("alpha", "alpha:0:0")?.Username);
         }
         finally
         {

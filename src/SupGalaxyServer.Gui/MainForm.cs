@@ -113,7 +113,7 @@ internal sealed class MainForm : Form
         var tabs = new TabControl { Dock = DockStyle.Fill };
 
         // Players tab
-        foreach (var (name, width) in new[] { ("Name", 170), ("World", 120), ("State", 85), ("Position", 150), ("Connected", 85), ("Port", 60), ("Address", 140), ("Role", 80) })
+        foreach (var (name, width) in new[] { ("Name", 170), ("World", 120), ("State", 85), ("Position", 150), ("Connected", 85), ("Port", 60), ("Address", 140), ("Msgs in/out", 110) })
             _players.Columns.Add(name, width);
         var playerButtons = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 36 };
         playerButtons.Controls.AddRange(new Control[] { _kick, _block });
@@ -366,7 +366,7 @@ internal sealed class MainForm : Form
                 {
                     p.Username, p.World ?? "", p.State.ToString(), $"{p.X:0.#}, {p.Y:0.#}, {p.Z:0.#}",
                     FormatDuration(DateTime.UtcNow - p.ConnectedAtUtc), p.Port.ToString(CultureInfo.InvariantCulture),
-                    p.RemoteAddress ?? "", p.IsWorldAuthority ? "Authority" : "Player",
+                    p.RemoteAddress ?? "", $"{p.MessagesIn}/{p.MessagesOut}",
                 };
                 if (i < _players.Items.Count)
                 {
@@ -406,7 +406,6 @@ internal sealed class MainForm : Form
             $"State:          {p.State}",
             $"ICE state:      {p.IceState ?? "-"}",
             $"World:          {p.World ?? "-"}",
-            $"Role:           {(p.IsWorldAuthority ? "World authority (runs game rules)" : "Player")}",
             $"Position:       {p.X:0.##}, {p.Y:0.##}, {p.Z:0.##}",
             $"Remote address: {p.RemoteAddress ?? "-"}",
             $"Player port:    {p.Port}",

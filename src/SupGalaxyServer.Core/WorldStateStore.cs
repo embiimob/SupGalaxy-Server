@@ -14,6 +14,12 @@ public enum StoneKind
 
 public sealed record WorldSummary(string World, int Chunks, int Blocks, int Stones, bool Dirty);
 
+/// <summary>Chunk ownership created by editing (SupGalaxy OWNED_CHUNKS entries of type "ipfs"). Unix milliseconds.</summary>
+public sealed record ChunkClaim(string Username, long ClaimDate, long ExpiryDate);
+
+/// <summary>A planted tree seed (SupGalaxy worldState.treeSeeds) that grows into a tree after five minutes.</summary>
+public sealed record TreeSeed(long X, long Y, long Z, string OriginSeed, long PlantedTime);
+
 /// <summary>
 /// Authoritative, persistent copy of every world's edits (block deltas, foreign block origins and stones).
 /// The layout mirrors SupGalaxy's WORLD_STATES (chunkDeltas keyed by makeChunkKey(world, cx, cz)) so it can be
@@ -36,9 +42,23 @@ public sealed class WorldStateStore
         public Dictionary<string, string> ForeignOrigins { get; } = new(StringComparer.Ordinal);
         public Dictionary<string, JsonNode> MagicianStones { get; } = new(StringComparer.Ordinal);
         public Dictionary<string, JsonNode> CalligraphyStones { get; } = new(StringComparer.Ordinal);
+
+        // Game rule state (only used by the server, never sent in world_sync).
+        public Dictionary<string, ChunkClaim> Claims { get; } = new(StringComparer.Ordinal);
+        public Dictionary<string, string> Homes { get; } = new(StringComparer.Ordinal);
+        public Dictionary<string, string> HomeOwnerByChunk { get; } = new(StringComparer.Ordinal);
+        public Dictionary<string, TreeSeed> TreeSeeds { get; } = new(StringComparer.Ordinal);
+        public Dictionary<string, JsonObject> SpawnCommands { get; } = new(StringComparer.Ordinal);
+
         public long Version;
         public long SavedVersion;
         public bool IsEmpty => Chunks.Count == 0 && ForeignOrigins.Count == 0 && MagicianStones.Count == 0 && CalligraphyStones.Count == 0;
+
+        public void AddHome(string username, string chunkKey)
+        {
+            Homes[username] = chunkKey;
+            HomeOwnerByChunk.TryAdd(chunkKey, username);
+        }
     }
 
     private readonly object _gate = new();
@@ -131,6 +151,110 @@ public sealed class WorldStateStore
         {
             return _worlds.TryGetValue(world, out var w) && (kind == StoneKind.Magician ? w.MagicianStones : w.CalligraphyStones).ContainsKey(key);
         }
+    }
+
+    /// <summary>Names of all worlds the store knows about.</summary>
+    public string[] WorldNames()
+    {
+        lock (_gate) return _worlds.Keys.ToArray();
+    }
+
+    public ChunkClaim? GetClaim(string world, string chunkKey)
+    {
+        lock (_gate) return _worlds.TryGetValue(world, out var w) && w.Claims.TryGetValue(chunkKey, out var c) ? c : null;
+    }
+
+    public void SetClaim(string world, string chunkKey, ChunkClaim claim)
+    {
+        lock (_gate)
+        {
+            GetOrCreate(world).Claims[chunkKey] = claim;
+            _worlds[world].Version++;
+        }
+    }
+
+    /// <summary>Records a player's home spawn chunk. Returns false when it was already known.</summary>
+    public bool RegisterHome(string world, string username, string chunkKey)
+    {
+        lock (_gate)
+        {
+            var w = GetOrCreate(world);
+            if (w.Homes.TryGetValue(username, out var existing) && existing == chunkKey) return false;
+            w.AddHome(username, chunkKey);
+            w.Version++;
+            return true;
+        }
+    }
+
+    /// <summary>The player whose home spawn chunk this is (the first one registered), or null.</summary>
+    public string? GetHomeOwner(string world, string chunkKey)
+    {
+        lock (_gate) return _worlds.TryGetValue(world, out var w) && w.HomeOwnerByChunk.TryGetValue(chunkKey, out var u) ? u : null;
+    }
+
+    public void AddTreeSeed(string world, string key, TreeSeed seed)
+    {
+        lock (_gate)
+        {
+            GetOrCreate(world).TreeSeeds[key] = seed;
+            _worlds[world].Version++;
+        }
+    }
+
+    public bool RemoveTreeSeed(string world, string key)
+    {
+        lock (_gate)
+        {
+            if (!_worlds.TryGetValue(world, out var w) || !w.TreeSeeds.Remove(key)) return false;
+            w.Version++;
+            return true;
+        }
+    }
+
+    /// <summary>Tree seeds planted at or before <paramref name="plantedBefore"/> (Unix ms), across all worlds.</summary>
+    public List<(string World, string Key, TreeSeed Seed)> TreeSeedsPlantedBefore(long plantedBefore)
+    {
+        lock (_gate)
+        {
+            var due = new List<(string, string, TreeSeed)>();
+            foreach (var w in _worlds.Values)
+                foreach (var (key, seed) in w.TreeSeeds)
+                    if (seed.PlantedTime <= plantedBefore) due.Add((w.Name, key, seed));
+            return due;
+        }
+    }
+
+    public bool TryAddSpawnCommand(string world, string key, JsonObject command)
+    {
+        lock (_gate)
+        {
+            var w = GetOrCreate(world);
+            if (!w.SpawnCommands.TryAdd(key, (JsonObject)command.DeepClone())) return false;
+            w.Version++;
+            return true;
+        }
+    }
+
+    public JsonObject? GetSpawnCommand(string world, string key)
+    {
+        lock (_gate)
+            return _worlds.TryGetValue(world, out var w) && w.SpawnCommands.TryGetValue(key, out var c) ? (JsonObject)c.DeepClone() : null;
+    }
+
+    public bool RemoveSpawnCommand(string world, string key)
+    {
+        lock (_gate)
+        {
+            if (!_worlds.TryGetValue(world, out var w) || !w.SpawnCommands.Remove(key)) return false;
+            w.Version++;
+            return true;
+        }
+    }
+
+    public JsonObject[] GetSpawnCommands(string world)
+    {
+        lock (_gate)
+            return _worlds.TryGetValue(world, out var w) ? w.SpawnCommands.Values.Select(c => (JsonObject)c.DeepClone()).ToArray() : [];
     }
 
     public WorldSummary[] Summaries()
@@ -239,6 +363,7 @@ public sealed class WorldStateStore
                         foreach (var kv in ms) if (kv.Value != null) w.MagicianStones[kv.Key] = kv.Value.DeepClone();
                     if (root["calligraphyStones"] is JsonObject cs)
                         foreach (var kv in cs) if (kv.Value != null) w.CalligraphyStones[kv.Key] = kv.Value.DeepClone();
+                    LoadRuleState(root, w);
                     _worlds[name] = w;
                     loaded++;
                 }
@@ -249,6 +374,25 @@ public sealed class WorldStateStore
             }
         }
         return loaded;
+    }
+
+    private static void LoadRuleState(JsonObject root, WorldData w)
+    {
+        if (root["claims"] is JsonObject claims)
+            foreach (var (key, v) in claims)
+                if (v is JsonObject c && c["username"]?.GetValue<string>() is { } user)
+                    w.Claims[key] = new ChunkClaim(user, c["claimDate"]!.GetValue<long>(), c["expiryDate"]!.GetValue<long>());
+        if (root["homes"] is JsonArray homes)
+            foreach (var entry in homes.OfType<JsonArray>())
+                if (entry.Count == 2) w.AddHome(entry[0]!.GetValue<string>(), entry[1]!.GetValue<string>());
+        if (root["treeSeeds"] is JsonObject seeds)
+            foreach (var (key, v) in seeds)
+                if (v is JsonObject t)
+                    w.TreeSeeds[key] = new TreeSeed(t["x"]!.GetValue<long>(), t["y"]!.GetValue<long>(), t["z"]!.GetValue<long>(),
+                        t["originSeed"]!.GetValue<string>(), t["plantedTime"]!.GetValue<long>());
+        if (root["spawnCommands"] is JsonObject commands)
+            foreach (var (key, v) in commands)
+                if (v is JsonObject c) w.SpawnCommands[key] = (JsonObject)c.DeepClone();
     }
 
     /// <summary>Discards all in-memory world state and deletes the saved session from disk.</summary>
@@ -327,9 +471,55 @@ public sealed class WorldStateStore
 
             WriteStones(writer, "magicianStones", w.MagicianStones);
             WriteStones(writer, "calligraphyStones", w.CalligraphyStones);
+            if (includeHeader) WriteRuleState(writer, w);
             writer.WriteEndObject();
         }
         return Encoding.UTF8.GetString(buffer.WrittenSpan);
+    }
+
+    private static void WriteRuleState(Utf8JsonWriter writer, WorldData w)
+    {
+        writer.WriteStartObject("claims");
+        foreach (var (key, c) in w.Claims)
+        {
+            writer.WriteStartObject(key);
+            writer.WriteString("username", c.Username);
+            writer.WriteNumber("claimDate", c.ClaimDate);
+            writer.WriteNumber("expiryDate", c.ExpiryDate);
+            writer.WriteEndObject();
+        }
+        writer.WriteEndObject();
+
+        writer.WriteStartArray("homes");
+        foreach (var (user, key) in w.Homes)
+        {
+            writer.WriteStartArray();
+            writer.WriteStringValue(user);
+            writer.WriteStringValue(key);
+            writer.WriteEndArray();
+        }
+        writer.WriteEndArray();
+
+        writer.WriteStartObject("treeSeeds");
+        foreach (var (key, t) in w.TreeSeeds)
+        {
+            writer.WriteStartObject(key);
+            writer.WriteNumber("x", t.X);
+            writer.WriteNumber("y", t.Y);
+            writer.WriteNumber("z", t.Z);
+            writer.WriteString("originSeed", t.OriginSeed);
+            writer.WriteNumber("plantedTime", t.PlantedTime);
+            writer.WriteEndObject();
+        }
+        writer.WriteEndObject();
+
+        writer.WriteStartObject("spawnCommands");
+        foreach (var (key, c) in w.SpawnCommands)
+        {
+            writer.WritePropertyName(key);
+            c.WriteTo(writer);
+        }
+        writer.WriteEndObject();
     }
 
     private static void WriteStones(Utf8JsonWriter writer, string name, Dictionary<string, JsonNode> stones)

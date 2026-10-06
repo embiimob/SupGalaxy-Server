@@ -24,6 +24,8 @@ public sealed class SupGalaxyServerHost : IAsyncDisposable
     private WebApplication? _app;
     private Timer? _saveTimer;
     private Timer? _healthTimer;
+    private Timer? _rulesTimer;
+    private int _rulesTickRunning;
     private CancellationTokenSource? _cts;
 
     /// <summary>Players must send something (SupGalaxy sends i_am_alive every 10s) within this time.</summary>
@@ -48,7 +50,6 @@ public sealed class SupGalaxyServerHost : IAsyncDisposable
         Players = new PlayerRegistry();
         Ports = new PortAllocator(Settings.PlayerPortStart, Settings.PlayerPortEnd, evenOnly: true);
         Relay = new GameRelay(Players, Worlds, Settings, WriteLog);
-        Relay.AuthorityChanged += (_, _) => PlayersChanged?.Invoke();
     }
 
     public ServerSettings Settings { get; }
@@ -66,7 +67,7 @@ public sealed class SupGalaxyServerHost : IAsyncDisposable
     /// <summary>Human readable log lines (thread pool threads - marshal to the UI thread before touching controls).</summary>
     public event Action<string>? Log;
 
-    /// <summary>Raised when a player connects, disconnects or a world authority changes.</summary>
+    /// <summary>Raised when a player connects or disconnects.</summary>
     public event Action? PlayersChanged;
 
     public async Task StartAsync(CancellationToken cancellationToken = default)
@@ -126,6 +127,7 @@ public sealed class SupGalaxyServerHost : IAsyncDisposable
         var interval = TimeSpan.FromMinutes(Settings.SaveIntervalMinutes);
         _saveTimer = new Timer(_ => SaveNowSafe("Incremental save"), null, interval, interval);
         _healthTimer = new Timer(_ => CheckPlayerHealth(), null, TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(5));
+        _rulesTimer = new Timer(_ => TickRules(), null, TimeSpan.FromMilliseconds(250), TimeSpan.FromMilliseconds(250));
 
         WriteLog($"Server '{Settings.ServerName}' listening on {string.Join(", ", ListeningUrls)}; " +
                  $"player ports {Settings.PlayerPortStart}-{Settings.PlayerPortEnd} ({Ports.Capacity} slots).");
@@ -144,6 +146,7 @@ public sealed class SupGalaxyServerHost : IAsyncDisposable
 
         _saveTimer?.Dispose();
         _healthTimer?.Dispose();
+        _rulesTimer?.Dispose();
         _cts?.Cancel();
 
         foreach (var p in Players.All())
@@ -214,7 +217,7 @@ public sealed class SupGalaxyServerHost : IAsyncDisposable
 
     /// <summary>Alphabetical, searchable snapshot of all players.</summary>
     public PlayerInfo[] GetPlayers(string? filter = null) =>
-        Players.Search(filter).Select(p => p.ToInfo(Relay.IsAuthority(p))).ToArray();
+        Players.Search(filter).Select(p => p.ToInfo()).ToArray();
 
     private object InfoObject() => new
     {
@@ -493,6 +496,24 @@ public sealed class SupGalaxyServerHost : IAsyncDisposable
             if (!t.IsCanceled && session.State == PlayerState.Connecting)
                 Disconnect(session, "connection timed out", notifyOthers: false);
         }, TaskScheduler.Default);
+    }
+
+    /// <summary>Timed game rules (tree growth, lava, volcanoes) for every world. Skips a tick if the last one is still running.</summary>
+    private void TickRules()
+    {
+        if (Interlocked.Exchange(ref _rulesTickRunning, 1) == 1) return;
+        try
+        {
+            Relay.Rules.Tick();
+        }
+        catch (Exception e)
+        {
+            WriteLog($"Game rules tick failed: {e.Message}");
+        }
+        finally
+        {
+            Volatile.Write(ref _rulesTickRunning, 0);
+        }
     }
 
     private void CheckPlayerHealth()
