@@ -170,6 +170,7 @@ public class PortAllocatorTests
         Assert.Equal(56556, s.PlayerPortEnd);
         Assert.Equal(1001, s.PlayerPortCount);
         Assert.Equal(501, s.MaxPlayers);
+        Assert.Equal(100 * 1024 * 1024, s.MaxImportSize);
         Assert.Empty(s.Validate());
     }
 }
@@ -205,5 +206,18 @@ public class BlockListAndSettingsTests
 
         s.SignalingPort = 60005;
         Assert.NotEmpty(s.Validate());
+    }
+
+    [Fact]
+    public void Settings_LegacyPendingImportLimit_IsUpgraded()
+    {
+        using var dir = new TempDir();
+        var path = Path.Combine(dir.Path, "settings.json");
+        File.WriteAllText(path, """{"ServerName":"x","MaxPendingImportsPerPlayer":4}""");
+        Assert.Equal(256, ServerSettings.Load(path).MaxPendingImportsPerPlayer);
+
+        // An explicit choice saved with the current settings format is kept.
+        new ServerSettings { MaxPendingImportsPerPlayer = 4 }.Save(path);
+        Assert.Equal(4, ServerSettings.Load(path).MaxPendingImportsPerPlayer);
     }
 }

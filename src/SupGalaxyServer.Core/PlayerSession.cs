@@ -62,8 +62,74 @@ public sealed class PlayerSession
     public DateTime LastSeenUtc { get; internal set; }
     public string? IceState { get; internal set; }
 
+    /// <summary>Client capabilities announced in POST /connect (e.g. "http_world_sync").</summary>
+    public IReadOnlySet<string> Features { get; internal set; } = new HashSet<string>();
+
     /// <summary>Worlds whose saved state has already been streamed to this player.</summary>
     internal HashSet<string> SyncedWorlds { get; } = new();
+
+    // World-state updates (block/stone edits, imports) that arrive while a world sync snapshot is being streamed
+    // are held back and delivered right after the snapshot, so a newer live edit is never overwritten by the
+    // older snapshot on the client and nothing applied after the snapshot is missed.
+    private readonly object _syncGate = new();
+    private readonly List<string> _syncBacklog = new();
+    private long _syncBacklogChars;
+    private int _activeSyncs;
+    private bool _syncBacklogOverflowed;
+
+    internal const long MaxSyncBacklogChars = 128L * 1024 * 1024;
+
+    internal bool IsSyncing
+    {
+        get { lock (_syncGate) return _activeSyncs > 0; }
+    }
+
+    internal void BeginSync()
+    {
+        lock (_syncGate) _activeSyncs++;
+    }
+
+    /// <summary>
+    /// Ends one snapshot stream. When it was the last one, flushes the held back updates in order.
+    /// Returns false if the backlog overflowed and was discarded (the caller must send a fresh snapshot).
+    /// </summary>
+    internal bool EndSync()
+    {
+        lock (_syncGate)
+        {
+            if (--_activeSyncs > 0) return true;
+            _activeSyncs = 0;
+            foreach (var m in _syncBacklog) Send(m);
+            _syncBacklog.Clear();
+            _syncBacklogChars = 0;
+            var ok = !_syncBacklogOverflowed;
+            _syncBacklogOverflowed = false;
+            return ok;
+        }
+    }
+
+    /// <summary>Delivers a world-state update now, or holds it until the running world sync has been sent.</summary>
+    internal void SendStateUpdate(string message)
+    {
+        lock (_syncGate)
+        {
+            if (_activeSyncs == 0)
+            {
+                Send(message);
+                return;
+            }
+            if (_syncBacklogOverflowed) return;
+            _syncBacklogChars += message.Length;
+            if (_syncBacklogChars > MaxSyncBacklogChars)
+            {
+                _syncBacklog.Clear();
+                _syncBacklogChars = 0;
+                _syncBacklogOverflowed = true;
+                return;
+            }
+            _syncBacklog.Add(message);
+        }
+    }
 
     public long MessagesIn => Interlocked.Read(ref _messagesIn);
     public long MessagesOut => Interlocked.Read(ref _messagesOut);

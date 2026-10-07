@@ -12,6 +12,9 @@ public sealed class ConnectRequest
     [JsonPropertyName("user")] public string? User { get; set; }
     [JsonPropertyName("offer")] public SessionDescription? Offer { get; set; }
     [JsonPropertyName("iceCandidates")] public List<IceCandidate>? IceCandidates { get; set; }
+
+    /// <summary>Optional client capabilities, e.g. "http_world_sync" (see ClientIntegrationNotes).</summary>
+    [JsonPropertyName("features")] public List<string>? Features { get; set; }
 }
 
 public sealed class SessionDescription
@@ -45,6 +48,9 @@ public sealed class ConnectResponse
     [JsonPropertyName("port")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] public int Port { get; set; }
     [JsonPropertyName("answer")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public SessionDescription? Answer { get; set; }
     [JsonPropertyName("iceCandidates")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public List<IceCandidate>? IceCandidates { get; set; }
+
+    /// <summary>Requested features the server accepted (only those it supports and has enabled).</summary>
+    [JsonPropertyName("features")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public List<string>? Features { get; set; }
 
     internal int StatusCode { get; set; } = 200;
 

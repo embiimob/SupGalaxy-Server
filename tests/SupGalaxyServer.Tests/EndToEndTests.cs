@@ -21,7 +21,9 @@ internal sealed class RtcTestClient : IDisposable
 
     public string? AnswerSdp { get; private set; }
 
-    public static async Task<(RtcTestClient Client, HttpResponseMessage Response)> ConnectAsync(HttpClient http, string user, string world, bool withAudio = false)
+    public JsonObject? ConnectBody { get; private set; }
+
+    public static async Task<(RtcTestClient Client, HttpResponseMessage Response)> ConnectAsync(HttpClient http, string user, string world, bool withAudio = false, string[]? features = null)
     {
         var client = new RtcTestClient();
         if (withAudio)
@@ -44,10 +46,12 @@ internal sealed class RtcTestClient : IDisposable
             user,
             offer = new { type = "offer", sdp = offer.sdp },
             iceCandidates = Array.Empty<object>(),
+            features,
         });
         if (!response.IsSuccessStatusCode) return (client, response);
 
         var body = (await response.Content.ReadFromJsonAsync<JsonObject>())!;
+        client.ConnectBody = body;
         client.AnswerSdp = (string)body["answer"]!["sdp"]!;
         var result = client._pc.setRemoteDescription(new RTCSessionDescriptionInit
         {
@@ -70,7 +74,8 @@ internal sealed class RtcTestClient : IDisposable
         return (client, response);
     }
 
-    public void Send(object message) => _dc!.send(System.Text.Json.JsonSerializer.Serialize(message));
+    // Same escaping as the browser's JSON.stringify.
+    public void Send(object message) => _dc!.send(System.Text.Json.JsonSerializer.Serialize(message, WireFormat.Options));
 
     public async Task<JsonObject> WaitFor(string type, Func<JsonObject, bool>? predicate = null, int timeoutMs = 10000)
     {
@@ -272,5 +277,96 @@ public class EndToEndTests : IAsyncLifetime
             await restarted.StopAsync();
         }
         _host = restarted;
+    }
+
+    [Fact]
+    public async Task LargeImport_OverWebRtc_IsMergedSharedAndSyncedToLateJoiner()
+    {
+        var (alice, _) = await RtcTestClient.ConnectAsync(_http, "alice", "Ender");
+        using var _a = alice;
+        await alice.WaitFor("server_welcome");
+        var (bob, _) = await RtcTestClient.ConnectAsync(_http, "bob", "Ender");
+        using var _b = bob;
+        await bob.WaitFor("server_welcome");
+
+        // A city-sized save session: many chunks, sent like SupGalaxy's applyChunkUpdates (128K char pieces).
+        var deltas = new JsonArray();
+        for (int c = 0; c < 400; c++)
+        {
+            var changes = new JsonArray();
+            for (int i = 0; i < 64; i++) changes.Add(new JsonObject { ["x"] = i % 16, ["y"] = 60 + i / 16, ["z"] = (i * 7) % 16, ["b"] = 5 + i % 3 });
+            deltas.Add(new JsonObject { ["chunk"] = $"Ender:{c % 20}:{c / 20}", ["changes"] = changes });
+        }
+        var payload = new JsonObject { ["deltas"] = deltas, ["foreignBlockOrigins"] = null, ["magicianStones"] = null }.ToJsonString();
+        const int size = 131072;
+        var parts = new List<string>();
+        for (int i = 0; i < payload.Length; i += size) parts.Add(payload.Substring(i, Math.Min(size, payload.Length - i)));
+        Assert.True(parts.Count > 5);
+
+        alice.Send(new { type = "ipfs_chunk_from_client_start", total = parts.Count, fromAddress = "addr", timestamp = 1790000000000L, world = "Ender", transactionId = "city" });
+        for (int i = 0; i < parts.Count; i++)
+            alice.Send(new { type = "ipfs_chunk_from_client_chunk", transactionId = "city", index = i, chunk = parts[i], total = parts.Count });
+
+        var ack = await alice.WaitFor("server_import_result", timeoutMs: 20000);
+        Assert.True((bool)ack["ok"]!, ack.ToJsonString());
+        Assert.True(_host.Worlds.IsImportProcessed("Ender", "city"));
+        await RelayTestBase.Eventually(() => bob.Received.Count(m => (string?)m["type"] == "ipfs_chunk_update_chunk") == parts.Count, 20000);
+
+        var (carol, _) = await RtcTestClient.ConnectAsync(_http, "carol", "Ender");
+        using var _c = carol;
+        var start = await carol.WaitFor("world_sync_start");
+        int total = (int)start["total"]!;
+        await RelayTestBase.Eventually(() => carol.Received.Count(m => (string?)m["type"] == "world_sync_chunk") == total, 20000);
+        var sync = JsonNode.Parse(string.Concat(carol.Received.Where(m => (string?)m["type"] == "world_sync_chunk")
+            .OrderBy(m => (int)m["index"]!).Select(m => (string)m["chunk"]!)))!;
+        Assert.Equal(400, sync["chunkDeltas"]!.AsArray().Count);
+        Assert.Contains("city", sync["processedIds"]!.AsArray().Select(n => (string?)n));
+    }
+
+    [Fact]
+    public async Task FastClient_DownloadsWorldOverHttp_AndGetsLiveUpdatesAfterwards()
+    {
+        var info = await _http.GetFromJsonAsync<JsonObject>("/info");
+        Assert.Contains(GameRelay.HttpWorldSyncFeature, info!["features"]!.AsArray().Select(n => (string?)n));
+
+        var (alice, _) = await RtcTestClient.ConnectAsync(_http, "alice", "alpha");
+        using var _a = alice;
+        await alice.WaitFor("server_welcome");
+        for (int i = 0; i < 2000; i++)
+            alice.Send(new { type = "block_change", world = "alpha", wx = i % 500, wy = 10 + i / 500, wz = 4, bid = 42, username = "alice" });
+        await RelayTestBase.Eventually(() => _host.Worlds.GetBlock("alpha", 1999 % 500, 10 + 1999 / 500, 4) == 42, 10000);
+
+        var (bob, _) = await RtcTestClient.ConnectAsync(_http, "bob", "alpha", features: new[] { GameRelay.HttpWorldSyncFeature, "unknown" });
+        using var _b = bob;
+        var connect = bob.ConnectBody!;
+        Assert.Equal(new[] { GameRelay.HttpWorldSyncFeature }, connect["features"]!.AsArray().Select(n => (string?)n));
+
+        var offer = await bob.WaitFor(GameRelay.HttpSyncOfferType);
+        Assert.Empty(bob.Received.Where(m => (string?)m["type"] == "world_sync_start"));
+
+        // Browser fetch(): gzip is decoded transparently.
+        using var handler = new HttpClientHandler { AutomaticDecompression = DecompressionMethods.GZip };
+        using var browser = new HttpClient(handler) { BaseAddress = _http.BaseAddress };
+        var res = await browser.GetAsync((string)offer["path"]!);
+        Assert.Equal(HttpStatusCode.OK, res.StatusCode);
+        var world = JsonNode.Parse(await res.Content.ReadAsStringAsync())!;
+        Assert.Equal(2000, world["chunkDeltas"]!.AsArray().Sum(c => c![1]!.AsArray().Count));
+
+        // Raw response really is compressed.
+        var rawReq = new HttpRequestMessage(HttpMethod.Get, (string)offer["path"]!);
+        rawReq.Headers.AcceptEncoding.ParseAdd("gzip");
+        var raw = await _http.SendAsync(rawReq);
+        Assert.Equal("gzip", raw.Content.Headers.ContentEncoding.Single());
+        Assert.True(raw.Content.Headers.ContentLength < (long)offer["bytes"]! / 3);
+
+        alice.Send(new { type = "block_change", world = "alpha", wx = 7, wy = 99, wz = 7, bid = 5, username = "alice" });
+        await Task.Delay(300);
+        Assert.DoesNotContain(bob.Received, m => (string?)m["type"] == "block_change");
+
+        bob.Send(new { type = GameRelay.HttpSyncDoneType, transactionId = (string)offer["transactionId"]! });
+        var live = await bob.WaitFor("block_change");
+        Assert.Equal(99, (int)live["wy"]!);
+        Assert.Equal(HttpStatusCode.NotFound, (await _http.GetAsync((string)offer["path"]!)).StatusCode);
+        Assert.Equal(HttpStatusCode.NotFound, (await _http.GetAsync("/world-sync/0000")).StatusCode);
     }
 }

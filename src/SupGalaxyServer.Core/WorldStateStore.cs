@@ -36,10 +36,29 @@ public sealed class WorldStateStore
         public Dictionary<string, string> ForeignOrigins { get; } = new(StringComparer.Ordinal);
         public Dictionary<string, JsonNode> MagicianStones { get; } = new(StringComparer.Ordinal);
         public Dictionary<string, JsonNode> CalligraphyStones { get; } = new(StringComparer.Ordinal);
+        public Dictionary<string, JsonNode> Chests { get; } = new(StringComparer.Ordinal);
+
+        /// <summary>Per block ("wx,wy,wz") truncated IPFS date of the last applied import (SupGalaxy ipfsTruncatedDates).</summary>
+        public Dictionary<string, long> IpfsDates { get; } = new(StringComparer.Ordinal);
+
+        /// <summary>Imported transaction ids, oldest first. Sent to clients as processedIds.</summary>
+        public HashSet<string> ProcessedIds { get; } = new(StringComparer.Ordinal);
+        public Queue<string> ProcessedOrder { get; } = new();
         public long Version;
         public long SavedVersion;
-        public bool IsEmpty => Chunks.Count == 0 && ForeignOrigins.Count == 0 && MagicianStones.Count == 0 && CalligraphyStones.Count == 0;
+        public bool IsEmpty => Chunks.Count == 0 && ForeignOrigins.Count == 0 && MagicianStones.Count == 0 && CalligraphyStones.Count == 0
+                               && Chests.Count == 0 && ProcessedIds.Count == 0;
+
+        public void AddProcessed(string id)
+        {
+            if (!ProcessedIds.Add(id)) return;
+            ProcessedOrder.Enqueue(id);
+            while (ProcessedOrder.Count > MaxProcessedIds) ProcessedIds.Remove(ProcessedOrder.Dequeue());
+        }
     }
+
+    /// <summary>Most recent imported transaction ids remembered per world (for idempotency and processedIds).</summary>
+    public const int MaxProcessedIds = 2048;
 
     private readonly object _gate = new();
     private readonly object _saveGate = new();
@@ -85,6 +104,84 @@ public sealed class WorldStateStore
                 w.ForeignOrigins[blockKey] = originSeed;
             w.Version++;
         }
+    }
+
+    /// <summary>True when an imported (Chunk Keyword / IPFS) transaction was already merged into the world.</summary>
+    public bool IsImportProcessed(string world, string transactionId)
+    {
+        lock (_gate) return _worlds.TryGetValue(world, out var w) && w.ProcessedIds.Contains(transactionId);
+    }
+
+    /// <summary>
+    /// Atomically merges a validated Chunk Keyword / IPFS import into the world. Block changes follow SupGalaxy's
+    /// monotonic IPFS ordering (shouldApplyIpfsUpdate): a change is applied only when the import's truncated date is
+    /// valid and &gt;= the date of the last import that wrote that block. Foreign origins, stones and chests are
+    /// last-writer-wins, as on the client. Returns the subset that was applied, or null when the transaction was
+    /// already merged (repeated delivery is a no-op).
+    /// </summary>
+    public WorldImport? ApplyImport(string world, string transactionId, long truncatedDate, WorldImport import)
+    {
+        lock (_gate)
+        {
+            var w = GetOrCreate(world);
+            if (w.ProcessedIds.Contains(transactionId)) return null;
+
+            var acceptedChunks = new List<ImportChunk>(import.Chunks.Count);
+            foreach (var c in import.Chunks)
+            {
+                var accepted = new List<ImportChange>();
+                foreach (var ch in c.Changes)
+                {
+                    var blockKey = $"{c.Cx * ChunkSize + ch.X},{ch.Y},{c.Cz * ChunkSize + ch.Z}";
+                    w.IpfsDates.TryGetValue(blockKey, out var existing);
+                    if (truncatedDate <= 0 || (existing > 0 && truncatedDate < existing)) continue;
+                    w.IpfsDates[blockKey] = truncatedDate;
+                    if (!w.Chunks.TryGetValue(c.Key, out var chunk))
+                    {
+                        chunk = new Dictionary<(long, long, long), long>();
+                        w.Chunks[c.Key] = chunk;
+                    }
+                    chunk[(ch.X, ch.Y, ch.Z)] = ch.B;
+                    accepted.Add(ch);
+                }
+                acceptedChunks.Add(new ImportChunk(c.Key, c.Cx, c.Cz, accepted, c.OwnershipNeutral));
+            }
+            foreach (var (k, seed) in import.ForeignOrigins) w.ForeignOrigins[k] = seed;
+            foreach (var (k, v) in import.MagicianStones) w.MagicianStones[k] = v.DeepClone();
+            foreach (var (k, v) in import.CalligraphyStones) w.CalligraphyStones[k] = v.DeepClone();
+            foreach (var (k, v) in import.Chests) w.Chests[k] = v.DeepClone();
+            w.AddProcessed(transactionId);
+            w.Version++;
+
+            return new WorldImport
+            {
+                IsObjectForm = import.IsObjectForm,
+                Chunks = acceptedChunks,
+                ForeignOrigins = import.ForeignOrigins,
+                MagicianStones = import.MagicianStones,
+                CalligraphyStones = import.CalligraphyStones,
+                Chests = import.Chests,
+            };
+        }
+    }
+
+    public bool HasChest(string world, string key)
+    {
+        lock (_gate) return _worlds.TryGetValue(world, out var w) && w.Chests.ContainsKey(key);
+    }
+
+    /// <summary>Current revision of a world (bumped by every applied edit), 0 for unknown worlds.</summary>
+    /// <summary>Changes whenever the whole store is replaced (Load / Reset), so (Generation, revision) identifies a snapshot.</summary>
+    public long Generation
+    {
+        get { lock (_gate) return _generation; }
+    }
+
+    private long _generation;
+
+    public long GetRevision(string world)
+    {
+        lock (_gate) return _worlds.TryGetValue(world, out var w) ? w.Version : 0;
     }
 
     public void SetStone(StoneKind kind, string world, string key, JsonNode data)
@@ -149,11 +246,16 @@ public sealed class WorldStateStore
     /// Builds the JSON payload SupGalaxy expects after re-assembling world_sync_chunk messages
     /// (see applyWorldStructureSync in js/web-rtc.js). Returns null if the world has no saved edits.
     /// </summary>
-    public string? BuildSyncPayload(string world)
+    public string? BuildSyncPayload(string world) => BuildSyncPayload(world, out _);
+
+    /// <summary>Same as <see cref="BuildSyncPayload(string)"/>, also returning the world revision the payload reflects.</summary>
+    public string? BuildSyncPayload(string world, out long revision)
     {
         lock (_gate)
         {
+            revision = 0;
             if (!_worlds.TryGetValue(world, out var w) || w.IsEmpty) return null;
+            revision = w.Version;
             return Serialize(w, includeHeader: false);
         }
     }
@@ -208,6 +310,7 @@ public sealed class WorldStateStore
         lock (_gate)
         {
             _worlds.Clear();
+            _generation++;
             foreach (var file in System.IO.Directory.EnumerateFiles(worldsDir, "*.json"))
             {
                 try
@@ -239,6 +342,15 @@ public sealed class WorldStateStore
                         foreach (var kv in ms) if (kv.Value != null) w.MagicianStones[kv.Key] = kv.Value.DeepClone();
                     if (root["calligraphyStones"] is JsonObject cs)
                         foreach (var kv in cs) if (kv.Value != null) w.CalligraphyStones[kv.Key] = kv.Value.DeepClone();
+                    if (root["chests"] is JsonObject chs)
+                        foreach (var kv in chs) if (kv.Value != null) w.Chests[kv.Key] = kv.Value.DeepClone();
+                    if (root["ipfsDates"] is JsonArray dates)
+                        foreach (var entry in dates.OfType<JsonArray>())
+                            if (entry.Count == 2) w.IpfsDates[entry[0]!.GetValue<string>()] = entry[1]!.GetValue<long>();
+                    if (root["processedIds"] is JsonArray ids)
+                        foreach (var id in ids) if (id is JsonValue v && v.TryGetValue<string>(out var s)) w.AddProcessed(s);
+                    if (root["version"] is JsonValue ver && ver.TryGetValue<long>(out var version) && version > 0)
+                        w.Version = w.SavedVersion = version;
                     _worlds[name] = w;
                     loaded++;
                 }
@@ -258,6 +370,7 @@ public sealed class WorldStateStore
         lock (_gate)
         {
             _worlds.Clear();
+            _generation++;
             if (_directory != null && System.IO.Directory.Exists(_directory))
                 System.IO.Directory.Delete(_directory, recursive: true);
             LastSaveUtc = null;
@@ -280,7 +393,7 @@ public sealed class WorldStateStore
     private static string Serialize(WorldData w, bool includeHeader)
     {
         var buffer = new ArrayBufferWriter<byte>();
-        using (var writer = new Utf8JsonWriter(buffer))
+        using (var writer = new Utf8JsonWriter(buffer, WireFormat.WriterOptions))
         {
             writer.WriteStartObject();
             if (includeHeader)
@@ -319,14 +432,26 @@ public sealed class WorldStateStore
             }
             writer.WriteEndArray();
 
-            if (!includeHeader)
+            writer.WriteStartArray("processedIds");
+            foreach (var id in w.ProcessedOrder) writer.WriteStringValue(id);
+            writer.WriteEndArray();
+
+            if (includeHeader)
             {
-                writer.WriteStartArray("processedIds");
+                writer.WriteStartArray("ipfsDates");
+                foreach (var (key, date) in w.IpfsDates)
+                {
+                    writer.WriteStartArray();
+                    writer.WriteStringValue(key);
+                    writer.WriteNumberValue(date);
+                    writer.WriteEndArray();
+                }
                 writer.WriteEndArray();
             }
 
             WriteStones(writer, "magicianStones", w.MagicianStones);
             WriteStones(writer, "calligraphyStones", w.CalligraphyStones);
+            WriteStones(writer, "chests", w.Chests);
             writer.WriteEndObject();
         }
         return Encoding.UTF8.GetString(buffer.WrittenSpan);
