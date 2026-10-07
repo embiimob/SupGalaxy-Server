@@ -43,6 +43,69 @@ Data directory (default `%LOCALAPPDATA%/SupGalaxyServer`, override with `--data`
 | POST | `/connect` | body `{world,user,offer:{type,sdp},iceCandidates}` → `{ok,answer:{type,sdp},iceCandidates,port,...}`. Errors: 400 `bad_request`, 403 `blocked`, 409 `name_in_use`, 503 `server_full`, 500 `negotiation_failed` |
 
 ## Internet hosting
-- Forward **TCP 55555** and **UDP 55556-56556** to the server. Set **Public IP** in the GUI (or `--public`) when the server is behind NAT.
-- Browsers on `https://` pages may only call plain `http://` on `127.0.0.1`/`localhost`. For remote players, set `CertificatePath`/`CertificatePassword` (a `.pfx` file) in `settings.json` so the server is reachable over `https://host:55555`.
-- Step-by-step guide (GoDaddy DNS, free Let's Encrypt certificate via win-acme, Windows Firewall, running as a service): [`docs/SSL-GoDaddy-WindowsServer.md`](docs/SSL-GoDaddy-WindowsServer.md).
+
+Browsers on `https://` pages block connections to plain `http://` addresses (except `127.0.0.1`). For players on the internet to reach your server, the signaling port (default **TCP 55555**) must serve HTTPS with a trusted certificate.
+
+This guide covers a **Windows** host using a free **Cloudflare** non-proxied DNS record and a free **Let's Encrypt** SSL certificate via `win-acme`. If you are running headless on Linux/macOS, see the [Other OS section](#other-os-headless).
+
+### 1. Cloudflare DNS Setup
+1. In your Cloudflare dashboard, go to your domain's **DNS** settings.
+2. Add an **A record** for your host (e.g., `play.supgalaxy.org`).
+3. Set the **IPv4 address** to your server's public IP.
+4. **Important:** Turn off the proxy status so it is **DNS only** (gray cloud icon). The game requires direct WebRTC connections.
+
+### 2. Windows Firewall & Router
+Open an **elevated PowerShell** and run these exact commands (copy and paste) to open the needed ports:
+```powershell
+New-NetFirewallRule -DisplayName "SupGalaxy signaling (TCP)" -Direction Inbound -Protocol TCP -LocalPort 55555 -Action Allow
+New-NetFirewallRule -DisplayName "SupGalaxy players (UDP)"   -Direction Inbound -Protocol UDP -LocalPort 55556-56556 -Action Allow
+New-NetFirewallRule -DisplayName "ACME HTTP validation"      -Direction Inbound -Protocol TCP -LocalPort 80 -Action Allow
+```
+*Note: You must also forward these same ports (TCP 55555, UDP 55556-56556, and TCP 80) on your home/office router or cloud VM network security group.*
+
+### 3. Let's Encrypt SSL via win-acme
+1. Download **win-acme x64 trimmed** from [win-acme.com](https://www.win-acme.com/) and extract it to `C:\win-acme`.
+2. Create the folders and restart script by copying and pasting this into your **elevated PowerShell**:
+   ```powershell
+   New-Item -ItemType Directory -Force C:\SupGalaxyServer\cert
+   Set-Content C:\SupGalaxyServer\restart.ps1 'Restart-Service SupGalaxyServer -ErrorAction SilentlyContinue'
+   ```
+3. Request the certificate (replace the placeholder domain and email, then copy/paste):
+   ```powershell
+   C:\win-acme\wacs.exe --source manual --host play.supgalaxy.org --validation selfhosting --store pfxfile --pfxfilepath C:\SupGalaxyServer\cert --pfxpassword "ChangeMe-PfxPassword" --installation script --script C:\SupGalaxyServer\restart.ps1 --accepttos --emailaddress you@example.com
+   ```
+4. Your certificate is now saved in `C:\SupGalaxyServer\cert`. win-acme will automatically renew it every ~60 days.
+
+### 4. Configure Server Settings
+Edit your `settings.json` (usually in `%LOCALAPPDATA%/SupGalaxyServer` or your `--data` folder) to point to the certificate. Use **double backslashes** in the path. Set `PublicAddress` to your server's public IP.
+```json
+{
+  "PublicAddress": "203.0.113.10",
+  "CertificatePath": "C:\\SupGalaxyServer\\cert\\play.supgalaxy.org.pfx",
+  "CertificatePassword": "ChangeMe-PfxPassword"
+}
+```
+
+### 5. Running as a Windows Service (NSSM)
+To keep the server running in the background and start on boot:
+1. Download NSSM from [nssm.cc](https://nssm.cc/download) and copy `win64\nssm.exe` to `C:\SupGalaxyServer\`.
+2. Install the service via **elevated PowerShell** (adjust paths as needed):
+   ```powershell
+   .\nssm.exe install SupGalaxyServer C:\SupGalaxyServer\app\SupGalaxyServer.Headless.exe "--data C:\SupGalaxyServer\data"
+   .\nssm.exe set SupGalaxyServer AppDirectory C:\SupGalaxyServer\app
+   .\nssm.exe set SupGalaxyServer Start SERVICE_AUTO_START
+   .\nssm.exe set SupGalaxyServer AppStopMethodConsole 15000
+   .\nssm.exe start SupGalaxyServer
+   ```
+
+### Other OS (Headless)
+If you are running the headless server on Linux or macOS, the same DNS and port requirements apply (TCP 55555, UDP 55556-56556, TCP 80).
+1. Use `certbot` to obtain the certificate (port 80 must be free):
+   ```bash
+   sudo certbot certonly --standalone -d play.supgalaxy.org
+   ```
+2. Combine the certificate and private key into a `.pfx` file that .NET can read:
+   ```bash
+   sudo openssl pkcs12 -export -out /etc/letsencrypt/live/play.supgalaxy.org/cert.pfx -inkey /etc/letsencrypt/live/play.supgalaxy.org/privkey.pem -in /etc/letsencrypt/live/play.supgalaxy.org/fullchain.pem -password pass:ChangeMe-PfxPassword
+   ```
+3. Update `settings.json` with the path to the `cert.pfx` file and the password, just like the Windows instructions.
